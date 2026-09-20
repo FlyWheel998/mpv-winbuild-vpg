@@ -26,6 +26,8 @@ ExternalProject_Add(mpv
         libsixel
         curl
     GIT_REPOSITORY https://github.com/mpv-player/mpv.git
+    GIT_TAG e76a35ec95b27f5cf2d27b043b5e2e0d90e468ae # pinned: VideoPlayerGold patches are made against this commit
+    PATCH_COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
     UPDATE_COMMAND ""
