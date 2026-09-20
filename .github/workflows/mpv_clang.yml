@@ -1,4 +1,4 @@
-name: mpv clang (VideoPlayerGold, x86_64_v3 only)
+name: mpv build (VideoPlayerGold, x86_64_v3 only)
 defaults:
   run:
     shell: bash
@@ -20,7 +20,6 @@ jobs:
   build_mpv:
     name: Building mpv
     runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion != 'failure' }}
     strategy:
       fail-fast: false
       matrix:
