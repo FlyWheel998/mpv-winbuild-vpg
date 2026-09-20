@@ -1,5 +1,5 @@
 From d3ca68f9d06e5daa8e37270731eda5b529111f3b Mon Sep 17 00:00:00 2001
-From: VideoPlayerGold <jestar001@gmail.com>
+From: VideoPlayerGold <127964164+FlyWheel998@users.noreply.github.com>
 Date: Sun, 20 Sep 2026 09:01:57 -0400
 Subject: [PATCH] vf_cudapass: identity CUDA filter (device-to-device copy
  spike)
