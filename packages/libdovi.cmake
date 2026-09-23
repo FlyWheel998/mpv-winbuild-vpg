@@ -29,7 +29,12 @@ ExternalProject_Add(libdovi
     GIT_TAG main
     UPDATE_COMMAND ""
     PATCH_COMMAND ""
-    CONFIGURE_COMMAND ${EXEC} LD_PRELOAD= cargo install cargo-c --locked
+    # cargo-c pulls in openssl-sys, which needs HOST OpenSSL development headers. The build
+    # container has none: "Could not find directory of OpenSSL installation... Make sure you
+    # also have the development packages of openssl installed", cargo exit 101. cargo-c ships a
+    # vendored-openssl feature for exactly this - it compiles OpenSSL from source instead of
+    # looking for a system one. Costs time on the first build only; the result is cached.
+    CONFIGURE_COMMAND ${EXEC} LD_PRELOAD= cargo install cargo-c --locked --features=vendored-openssl
     BUILD_COMMAND ${EXEC}
         LD_PRELOAD=
         CARGO_BUILD_TARGET_DIR=<BINARY_DIR>
