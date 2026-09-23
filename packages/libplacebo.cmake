@@ -9,6 +9,7 @@ ExternalProject_Add(libplacebo
         glad
         fast_float
         xxhash
+        libdovi
     GIT_REPOSITORY https://github.com/haasn/libplacebo.git
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
@@ -29,6 +30,8 @@ ExternalProject_Add(libplacebo
         -Db_ndebug=true
         -Doptimization=3
         -Dvulkan-registry='${MINGW_INSTALL_PREFIX}/share/vulkan/registry/vk.xml'
+        -Ddovi=enabled
+        -Dlibdovi=enabled
         -Ddemos=false
     BUILD_COMMAND ${EXEC} ninja -C <BINARY_DIR>
     INSTALL_COMMAND ${EXEC} ninja -C <BINARY_DIR> install
