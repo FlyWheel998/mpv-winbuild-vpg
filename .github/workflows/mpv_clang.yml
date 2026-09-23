@@ -100,6 +100,12 @@ jobs:
           MPV_TARBALL: ${{ github.event.inputs.mpv_tarball }}
         run: |
           ninja -C build_$BIT update
+          # Build libdovi EXPLICITLY. ExternalProject hangs a DEPENDS edge off the dependent's
+          # download/mkdir step, and libplacebo's were restored from cache and never re-ran - so
+          # ninja never descended into libdovi. Five runs produced no libdovi log at all while all
+          # 106 other packages had one, and libplacebo configured with "libdovi : NO" while
+          # reporting success. Naming the target removes the guesswork.
+          ninja -C build_$BIT libdovi
           $MPV_TARBALL && ninja -C build_$BIT mpv-release || ninja -C build_$BIT mpv
           $MPV_TARBALL && echo "mpv_ver=$(cat build_$BIT/packages/mpv-release-prefix/VERSION)" >> $GITHUB_OUTPUT || echo "mpv_ver=UNKNOWN" >> $GITHUB_OUTPUT
 
