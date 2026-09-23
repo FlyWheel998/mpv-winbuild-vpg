@@ -2,6 +2,17 @@ ExternalProject_Add(openal-soft
     DEPENDS
         libsdl2
     GIT_REPOSITORY https://github.com/kcat/openal-soft.git
+    GIT_REMOTE_NAME origin
+    GIT_TAG master
+    # Pinned 2026-09-23. openal-soft master broke the SAME DAY: commits "Move the OpenAL EAX API
+    # declarations to their own header" and "Move eax_log_exception to where it's used" left
+    # al/eax.cpp including "logging.h" without the include path, so clang-scan-deps fails with
+    # 'logging.h' file not found while generating the C++ module dependency file. Nothing to do
+    # with this branch's Dolby Vision work - it simply landed between builds.
+    # 8d2d2e2e is 2026-09-14, before the breakage and before the last known-good build.
+    # Remove this pin once upstream fixes it; shinchiro has a standing habit of
+    # "openal-soft: fix build" commits, so it will not stay broken for long.
+    GIT_RESET 8d2d2e2ed1f51df960e7eb4bb26b64625c873c0d
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
     UPDATE_COMMAND ""
