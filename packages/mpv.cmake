@@ -26,7 +26,17 @@ ExternalProject_Add(mpv
         libsixel
         curl
     GIT_REPOSITORY https://github.com/mpv-player/mpv.git
-    GIT_TAG e76a35ec95b27f5cf2d27b043b5e2e0d90e468ae # pinned: VideoPlayerGold patches are made against this commit
+    GIT_REMOTE_NAME origin
+    GIT_TAG master
+    # Pinned via GIT_RESET, not via GIT_TAG. force_rebuild_git() reads _EP_GIT_RESET and uses it
+    # as the reset target; with only a bare commit in GIT_TAG and no GIT_REMOTE_NAME it takes the
+    # "" branch and runs `git reset --hard` with NO target, which resets to HEAD - the tree as the
+    # previous build left it, already patched. `git am` then re-applied the same patches on top and
+    # conflicted on filters/user_filters.c, user_filters.h and meson.build. That is why the first
+    # build after 2026-09-20 failed while the run that created the cache succeeded: nothing was
+    # wrong with the patches, the source was simply never rewound. GIT_RESET is the pattern the
+    # other pinned packages here already use (angle-headers, libpsl, mbedtls, openssl).
+    GIT_RESET e76a35ec95b27f5cf2d27b043b5e2e0d90e468ae
     PATCH_COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
