@@ -56,7 +56,13 @@ jobs:
 
       - uses: actions/checkout@main
         with:
-          ref: master
+          # Was hardcoded to master. workflow_dispatch takes the WORKFLOW FILE from the ref you
+          # dispatch, but this checkout then pulled master regardless - so six runs on branch
+          # 'dovi' all built master. CMake kept reporting "Parsing 106 packages" (master's exact
+          # count) while the branch had 107, and ninja reported "unknown target 'libdovi'"
+          # because libdovi.cmake was never checked out. Every conclusion drawn from those runs
+          # about the package recipes was therefore drawn from code that was never compiled.
+          ref: ${{ github.ref_name }}
 
       - name: Loading clang sysroot cache
         uses: actions/cache/restore@main
