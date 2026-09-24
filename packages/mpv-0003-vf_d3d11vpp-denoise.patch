@@ -35,7 +35,7 @@ processor does not offer it, a warning is printed and nothing is set.
  };
  
  struct priv {
-@@ -392,6 +393,48 @@
+@@ -392,6 +393,45 @@
                                                                   p->video_proc,
                                                                   0, FALSE);
  
@@ -67,17 +67,14 @@ processor does not offer it, a warning is printed and nothing is set.
 +                level = MPCLAMP(level, range.Minimum, range.Maximum);
 +                ID3D11VideoContext_VideoProcessorSetStreamFilter(p->video_ctx, p->video_proc, 0,
 +                        D3D11_VIDEO_PROCESSOR_FILTER_NOISE_REDUCTION, TRUE, level);
-+                MP_VERBOSE(vf, "Noise reduction: %d%% -> level %d (range %d..%d, default %d).
-+",
++                MP_VERBOSE(vf, "Noise reduction: %d%% -> level %d (range %d..%d, default %d).\n",
 +                           p->opts->denoise, level, range.Minimum, range.Maximum,
 +                           range.Default);
 +            } else {
-+                MP_WARN(vf, "Could not read the noise reduction range.
-+");
++                MP_WARN(vf, "Could not read the noise reduction range.\n");
 +            }
 +        } else {
-+            MP_WARN(vf, "This video processor does not support noise reduction.
-+");
++            MP_WARN(vf, "This video processor does not support noise reduction.\n");
 +        }
 +    }
 +
