@@ -113,6 +113,22 @@ jobs:
           # reporting success. Naming the target removes the guesswork.
           ninja -C build_$BIT libdovi
           $MPV_TARBALL && ninja -C build_$BIT mpv-release || ninja -C build_$BIT mpv
+
+      - name: Show the failing build log
+        if: failure()
+        # ExternalProject is configured with LOG_BUILD 1, so a compile error goes to a file and
+        # NEVER to the CI output - the job just prints "Command failed: 1". A failed run was
+        # therefore undiagnosable without another cycle, which is part of why an earlier feature
+        # took eleven of them. Print the tail of whatever actually failed.
+        run: |
+          for f in $(ls -t build_$BIT/packages/*-prefix/src/*-stamp/*-build-*.log 2>/dev/null | head -3); do
+            echo "=============== $f"
+            tail -120 "$f"
+          done
+          for f in $(ls -t build_$BIT/packages/*-prefix/src/*-stamp/*-configure-*.log 2>/dev/null | head -2); do
+            echo "=============== $f"
+            tail -40 "$f"
+          done
           $MPV_TARBALL && echo "mpv_ver=$(cat build_$BIT/packages/mpv-release-prefix/VERSION)" >> $GITHUB_OUTPUT || echo "mpv_ver=UNKNOWN" >> $GITHUB_OUTPUT
 
       - name: Packaging mpv
