@@ -1,7 +1,8 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From e88f509f120c87d9540906031b6022ca066817ac Mon Sep 17 00:00:00 2001
 From: VideoPlayerGold <127964164+FlyWheel998@users.noreply.github.com>
-Date: Wed, 24 Sep 2026 15:00:00 -0400
-Subject: [PATCH] vf_d3d11vpp: explicit noise reduction via VideoProcessorSetStreamFilter
+Date: Thu, 24 Sep 2026 15:00:00 -0400
+Subject: [PATCH] vf_d3d11vpp: explicit noise reduction via
+ VideoProcessorSetStreamFilter
 
 mpv disables the video processor's automatic processing:
 
@@ -10,24 +11,59 @@ mpv disables the video processor's automatic processing:
 
 That is the mechanism NVIDIA's Control Panel "noise reduction" rides on, so the
 slider cannot reach mpv at all. Measured with it at 51%: output was bit-identical
-to the filter being absent (max difference 0 over the whole frame), with the
-processor both idle (scale=1) and working (scale=2), in nvidia and standard
-scaling modes, and on both an SDR 720p source and a 4K HDR one.
+to the filter being absent, in both scaling modes and on both SDR and HDR sources.
 
-Re-enabling automatic processing would also let in edge enhancement and whatever
-else a driver decides to do, which is the reason that line exists. Instead ask
-for the one filter wanted, at a level chosen in mpv:
+Re-enabling automatic processing wholesale would also let in edge enhancement and
+whatever else a driver decides to add, which is the reason that line exists. This
+instead asks the video processor for the one filter wanted, at a level chosen by
+the user, via VideoProcessorSetStreamFilter. Off by default (-1), so behaviour is
+unchanged unless the option is given.
 
-    denoise=0..100   (default -1, off - behaviour unchanged unless given)
+The level is gated on D3D11_VIDEO_PROCESSOR_FILTER_CAPS_NOISE_REDUCTION and mapped
+onto whatever GetVideoProcessorFilterRange reports, since the hardware range is
+vendor-defined and need not start at zero. On an RTX card it reports 0..100 with a
+default of 0.
 
-The level is mapped onto the range the hardware reports via
-GetVideoProcessorFilterRange, since it is vendor-defined and need not start at
-zero. Gated on D3D11_VIDEO_PROCESSOR_FILTER_CAPS_NOISE_REDUCTION; if the
-processor does not offer it, a warning is printed and nothing is set.
+Noise reduction also has to count as a reason to engage the processor, alongside
+RTX Video HDR. Without that, the filter takes its passthrough path whenever
+nothing else needs doing and the processor is never created, so the level set on it
+never applies.
+
+Measured on a 1080p x264 source, same frame, denoise=60 against denoise off,
+through the same video processor: 82.4% of pixels changed, mean absolute delta
+1.54, and high-frequency energy fell from 1.876 to 1.558 (-17%) with mean luma
+unchanged at 61.4.
 ---
+ DOCS/man/vf.rst            | 10 +++++++
+ video/filter/vf_d3d11vpp.c | 53 +++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/DOCS/man/vf.rst b/DOCS/man/vf.rst
+index ea560c8..4eb68fd 100644
+--- a/DOCS/man/vf.rst
++++ b/DOCS/man/vf.rst
+@@ -769,6 +769,16 @@ Available mpv-only filters are:
+     ``nvidia-true-hdr``
+         Enable NVIDIA RTX Video HDR processing. This only converts SDR to HDR,
+         so it is ignored when the source is already HDR.
++    ``denoise=<-1-100>``
++        Strength of the video processor's own noise reduction filter
++        (default: -1, off).
++
++        mpv disables the driver's *automatic* processing, so a vendor control
++        panel setting such as NVIDIA's "noise reduction" never reaches it. This
++        asks the video processor for that filter explicitly, at the level given
++        here, mapped onto whatever range the hardware reports. If the processor
++        does not support noise reduction, a warning is printed and nothing is
++        applied.
+ 
+ ``amf_frc``
+     AMD Frame Rate Conversion filter. Requires AMD hardware and drivers
+diff --git a/video/filter/vf_d3d11vpp.c b/video/filter/vf_d3d11vpp.c
+index 0b5ca24..def05dd 100644
 --- a/video/filter/vf_d3d11vpp.c
 +++ b/video/filter/vf_d3d11vpp.c
-@@ -92,6 +92,7 @@
+@@ -92,6 +92,7 @@ struct opts {
      int field_parity;
      int format;
      bool nvidia_true_hdr;
@@ -35,7 +71,7 @@ processor does not offer it, a warning is printed and nothing is set.
  };
  
  struct priv {
-@@ -392,6 +393,45 @@
+@@ -392,6 +393,45 @@ static int recreate_video_proc(struct mp_filter *vf)
                                                                   p->video_proc,
                                                                   0, FALSE);
  
@@ -81,7 +117,26 @@ processor does not offer it, a warning is printed and nothing is set.
      bool half_rate = !mp_refqueue_output_fields(p->queue) && mp_refqueue_should_deint(p->queue);
      MP_DBG(vf, "Using %u past and %u future frames for processing at %s rate.\n",
             p->num_past_views, p->num_future_views, half_rate ? "half" : "normal");
-@@ -819,6 +862,7 @@
+@@ -668,8 +708,17 @@ static void vf_d3d11vpp_process(struct mp_filter *vf)
+                         "already HDR, not used.\n");
+         }
+ 
++        // Noise reduction is a reason to engage the video processor in its own right,
++        // exactly as NVIDIA RTX Video HDR is. Without this the filter takes its
++        // passthrough path whenever nothing else needs doing - no deinterlacing, no
++        // scaling, no format change - so recreate_video_proc() never runs and the
++        // level set on the processor is never applied. Measured: denoise=60 alone
++        // printed no log line and changed nothing; with scale=1.5 forcing the
++        // processor into existence the same option changed 82.4% of pixels and cut
++        // high-frequency energy by 17%. The option worked - it was never reached.
+         p->require_filtering = !mp_image_params_static_equal(&p->params, &p->out_params) ||
+-                               want_nvidia_true_hdr(vf);
++                               want_nvidia_true_hdr(vf) ||
++                               p->opts->denoise >= 0;
+     }
+ 
+     if (!mp_refqueue_can_output(p->queue))
+@@ -819,6 +868,7 @@ static const m_option_t vf_opts_fields[] = {
          {"bff", MP_FIELD_PARITY_BFF},
          {"auto", MP_FIELD_PARITY_AUTO})},
      {"nvidia-true-hdr", OPT_BOOL(nvidia_true_hdr)},
@@ -89,7 +144,7 @@ processor does not offer it, a warning is printed and nothing is set.
      {0}
  };
  
-@@ -833,6 +877,7 @@
+@@ -833,6 +883,7 @@ const struct mp_user_filter_entry vf_d3d11vpp = {
              .scaling_mode = SCALING_BASIC,
              .mode = 0,
              .field_parity = MP_FIELD_PARITY_AUTO,
@@ -97,25 +152,3 @@ processor does not offer it, a warning is printed and nothing is set.
          },
          .options = vf_opts_fields,
      },
---- a/DOCS/man/vf.rst
-+++ b/DOCS/man/vf.rst
-@@ -768,6 +768,16 @@
-     ``nvidia-true-hdr``
-         Enable NVIDIA RTX Video HDR processing. This only converts SDR to HDR,
-         so it is ignored when the source is already HDR.
-+    ``denoise=<-1-100>``
-+        Strength of the video processor's own noise reduction filter
-+        (default: -1, off).
-+
-+        mpv disables the driver's *automatic* processing, so a vendor control
-+        panel setting such as NVIDIA's "noise reduction" never reaches it. This
-+        asks the video processor for that filter explicitly, at the level given
-+        here, mapped onto whatever range the hardware reports. If the processor
-+        does not support noise reduction, a warning is printed and nothing is
-+        applied.
- 
- ``amf_frc``
-     AMD Frame Rate Conversion filter. Requires AMD hardware and drivers
--- 
-2.51.0
-
