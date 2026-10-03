@@ -1,0 +1,2040 @@
+From 0930e1ae5f271b077e3f80452581d6b18ca5eb8c Mon Sep 17 00:00:00 2001
+From: VideoPlayerGold <127964164+FlyWheel998@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 18:26:19 -0400
+Subject: [PATCH] vf_nvvfx: TrueHDR, 10-bit RGB10A2 VSR path, quality to 23,
+ strength, scale=2
+
+Moves the filter to the VFX SDK 1.3.0 runtime (TrueHDR needs it) and adds:
+ - effect=truehdr: SDR -> HDR10 on the GPU. RGBA8 in, RGB10A2 BT.2020/PQ out, converted to
+   limited-range P010 and tagged BT.2020/PQ with max_luma = the luminance given to the network.
+ - encoding=10: VSR on RGB10A2. Accepts HDR (the 8-bit path still declines it).
+ - quality 0-23 (HighBitrate 16-19, Streaming 21/23), strength 0..1, scale=2 for levels 1-4.
+ - live vf-commands for quality, strength, enable and every TrueHDR tunable.
+NvCVImage RGB10A2/P32 = 13/11, probed from NVCVImage.dll 1.3.0.
+---
+ video/filter/vf_nvvfx.c     |  390 ++++++++--
+ video/filter/vf_nvvfx_ptx.h | 1332 +++++++++++++++++++++++------------
+ 2 files changed, 1216 insertions(+), 506 deletions(-)
+
+diff --git a/video/filter/vf_nvvfx.c b/video/filter/vf_nvvfx.c
+index 0ee4444..f7d0a98 100644
+--- a/video/filter/vf_nvvfx.c
++++ b/video/filter/vf_nvvfx.c
+@@ -28,6 +28,15 @@
+  * precision (errors clustering on 65535/512): invisible in 8-bit SDR, not invisible in 10-bit PQ,
+  * where the code values are packed near black. An HDR frame passes through untouched.
+  *
++ * Revision 2 (2026-10-03, PLAN_nvidia_ai_filters Stage A1) adds, on the VFX SDK 1.3.0 runtime:
++ *   - effect=truehdr : NVIDIA TrueHDR (SDR -> HDR10). Takes 8-bit RGBA, returns packed RGB10A2 in
++ *     BT.2020 / PQ; converted here to limited-range P010 and tagged like an HDR10 disc, with the
++ *     mastering peak set to the luminance asked of the network, not a guessed 1000 nits.
++ *   - encoding=10 for effect=vsr : the 10-bit RGB10A2 path. It removes the 8-bit quantisation that
++ *     made HDR unsafe (F-R384), so HDR is accepted on this path; the 8-bit path still declines it.
++ *   - quality up to 23 (HighBitrate 16-19, Streaming 21/23), strength, and scale=2 for the VSR
++ *     upscale levels 1-4 (the denoise/deblur levels are 1:1 by the SDK's own rule).
++ *
+  * Requires cuda frames, so it needs --hwdec=nvdec and an OpenGL or Vulkan backend; mpv's CUDA
+  * interop has no D3D11 path. With the copy-back decoders it will see software frames and pass
+  * them through.
+@@ -78,6 +87,11 @@
+ #define NVCV_U8     1
+ #define NVCV_CHUNKY 0
+ #define NVCV_GPU    1
++// 10-bit packed RGB: one 32-bit word per pixel, R bits 0-9, G 10-19, B 20-29. The values are not in
++// any public header; NVCVImage.dll 1.3.0 accepts pixel format 13 only with component type 11 and
++// reports 4 bytes per pixel for it (probed 2026-10-03, F-R407).
++#define NVCV_RGB10A2 13
++#define NVCV_P32     11
+ 
+ typedef struct NvCVImage {
+     unsigned int width, height;
+@@ -95,6 +109,7 @@ typedef void *NvVFX_Handle;
+ typedef int (*pfn_CreateEffect)(const char *, NvVFX_Handle *);
+ typedef int (*pfn_DestroyEffect)(NvVFX_Handle);
+ typedef int (*pfn_SetU32)(NvVFX_Handle, const char *, unsigned int);
++typedef int (*pfn_SetF32)(NvVFX_Handle, const char *, float);
+ typedef int (*pfn_SetImage)(NvVFX_Handle, const char *, NvCVImage *);
+ typedef int (*pfn_GetImage)(NvVFX_Handle, const char *, NvCVImage *);
+ typedef int (*pfn_SetCudaStream)(NvVFX_Handle, const char *, CUstream);
+@@ -108,6 +123,7 @@ struct sdk {
+     pfn_CreateEffect CreateEffect;
+     pfn_DestroyEffect DestroyEffect;
+     pfn_SetU32 SetU32;
++    pfn_SetF32 SetF32;
+     pfn_SetImage SetImage;
+     pfn_GetImage GetImage;
+     pfn_SetCudaStream SetCudaStream;
+@@ -125,8 +141,8 @@ static const char *const k_preload[] = {
+     "nppc64_12.dll", "nppial64_12.dll", "nppicc64_12.dll", "nppidei64_12.dll",
+     "nppif64_12.dll", "nppig64_12.dll", "nppim64_12.dll", "nppist64_12.dll",
+     "nppitc64_12.dll", "nvinfer_10.dll", "nvinfer_plugin_10.dll", "nvonnxparser_10.dll",
+-    "nvngxruntime.dll", "NVCVImage.dll", "NVVideoEffects.dll",
+-    "nvVFXVideoSuperRes.dll", "nvngx_vsr.dll",
++    "cudart64_12.dll", "nvngxruntime.dll", "NVCVImage.dll", "NVVideoEffects.dll",
++    "nvVFXVideoSuperRes.dll", "nvngx_vsr.dll", "nvVFXTrueHDR.dll", "nvngx_truehdr.dll",
+ };
+ 
+ static bool sdk_load(struct mp_filter *f, struct sdk *s, const char *dir)
+@@ -179,6 +195,7 @@ static bool sdk_load(struct mp_filter *f, struct sdk *s, const char *dir)
+     SYM(vfx,  CreateEffect,  "NvVFX_CreateEffect");
+     SYM(vfx,  DestroyEffect, "NvVFX_DestroyEffect");
+     SYM(vfx,  SetU32,        "NvVFX_SetU32");
++    SYM(vfx,  SetF32,        "NvVFX_SetF32");
+     SYM(vfx,  SetImage,      "NvVFX_SetImage");
+     SYM(vfx,  GetImage,      "NvVFX_GetImage");
+     SYM(vfx,  SetCudaStream, "NvVFX_SetCudaStream");
+@@ -192,8 +209,18 @@ static bool sdk_load(struct mp_filter *f, struct sdk *s, const char *dir)
+ 
+ // ── filter ───────────────────────────────────────────────────────────────────
+ 
++enum { EFFECT_VSR = 0, EFFECT_TRUEHDR = 1 };
++
+ struct opts {
+-    int quality;        // 0 = passthrough; 8..11 denoise, 12..15 de-block (SDK QualityLevel)
++    int effect;         // EFFECT_VSR or EFFECT_TRUEHDR
++    int quality;        // VSR: 0 = passthrough; 1-4 upscale, 8-11 denoise, 12-15 deblur,
++                        // 16-19 high-bitrate, 21/23 streaming (SDK QualityLevel)
++    float strength;     // VSR Strength 0..1; negative = leave the SDK default (1.0)
++    int encoding;       // VSR: 8 = RGBA8 path (declines HDR), 10 = RGB10A2 path (accepts HDR)
++    int scale;          // VSR: 1 or 2 (2 only for the upscale levels 1-4)
++    int contrast, saturation, middlegray, luminance;   // TrueHDR tunables (SDK ranges)
++    bool debanding;     // TrueHDR: false sets DebandingOff=1
++    bool enable;        // TrueHDR on/off without a graph rebuild
+     char *libdir;
+     bool sync;          // time the effect exactly, at the cost of a stall
+     int log_every;
+@@ -242,16 +269,18 @@ struct priv {
+     AVBufferRef *frames_ref;
+ 
+     CUmodule module;
+-    CUfunction k_to_rgba, k_to_yuv;
++    CUfunction k_to_rgba, k_to_yuv, k_to_rgb10, k_from_rgb10;
+ 
+     NvVFX_Handle fx;
+     NvCVImage in_img, out_img;
+-    int fx_w, fx_h, fx_quality;
++    int fx_effect, fx_enc, fx_w, fx_h, fx_ow, fx_oh, fx_quality;
++    float fx_strength;
++    int fx_tun[5];      // contrast, saturation, middlegray, luminance, debanding-off as applied
+     bool fx_ready;
+ 
+     int64_t frames_in, frames_done;
+     double ms_sum;
+-    bool warned_hdr, warned_sw, warned_fmt;
++    bool warned_hdr, warned_sw, warned_fmt, warned_scale, warned_thdr_hdr;
+ };
+ 
+ static void fx_destroy(struct priv *p)
+@@ -265,33 +294,88 @@ static void fx_destroy(struct priv *p)
+     p->fx_ready = false;
+ }
+ 
+-static bool fx_ensure(struct mp_filter *f, struct priv *p, int w, int h, int quality)
++static void truehdr_tunables(const struct opts *o, int t[5])
+ {
+-    if (p->fx_ready && p->fx_w == w && p->fx_h == h) {
+-        if (p->fx_quality != quality) {
+-            // Changing level needs no reload: this is what makes per-scene strength possible.
+-            if (p->sdk.SetU32(p->fx, "QualityLevel", (unsigned)quality) != 0) {
+-                MP_WARN(f, "nvvfx: could not change QualityLevel to %d\n", quality);
++    t[0] = o->contrast; t[1] = o->saturation; t[2] = o->middlegray; t[3] = o->luminance;
++    t[4] = o->debanding ? 0 : 1;
++}
++
++// Apply the settings that change without a reload: VSR level/strength, TrueHDR tunables.
++static bool fx_apply_live(struct mp_filter *f, struct priv *p, int quality)
++{
++    if (p->fx_effect == EFFECT_TRUEHDR) {
++        static const char *const names[5] = {"Contrast", "Saturation", "MiddleGray", "Luminance",
++                                             "DebandingOff"};
++        int t[5];
++        truehdr_tunables(p->opts, t);
++        for (int n = 0; n < 5; n++) {
++            if (t[n] == p->fx_tun[n])
++                continue;
++            if (p->sdk.SetU32(p->fx, names[n], (unsigned)t[n]) != 0) {
++                MP_WARN(f, "nvvfx: TrueHDR %s=%d refused\n", names[n], t[n]);
+                 return false;
+             }
+-            p->fx_quality = quality;
+-            MP_VERBOSE(f, "nvvfx: QualityLevel -> %d (no reload)\n", quality);
++            p->fx_tun[n] = t[n];
++            MP_VERBOSE(f, "nvvfx: TrueHDR %s -> %d (no reload)\n", names[n], t[n]);
+         }
+         return true;
+     }
++    if (p->fx_quality != quality) {
++        // Changing level needs no reload: this is what makes per-scene strength possible.
++        if (p->sdk.SetU32(p->fx, "QualityLevel", (unsigned)quality) != 0) {
++            MP_WARN(f, "nvvfx: could not change QualityLevel to %d\n", quality);
++            return false;
++        }
++        p->fx_quality = quality;
++        MP_VERBOSE(f, "nvvfx: QualityLevel -> %d (no reload)\n", quality);
++    }
++    float st = p->opts->strength;
++    if (st >= 0 && st != p->fx_strength) {
++        if (p->sdk.SetF32(p->fx, "Strength", st) != 0) {
++            MP_WARN(f, "nvvfx: Strength %.2f refused\n", st);
++            return false;
++        }
++        p->fx_strength = st;
++    }
++    return true;
++}
++
++// in: w x h, out: ow x oh. enc 8/10 selects RGBA8 or RGB10A2 for VSR; TrueHDR is always
++// RGBA8 in and RGB10A2 out (the SDK's own contract strings).
++static bool fx_ensure(struct mp_filter *f, struct priv *p, int effect, int enc,
++                      int w, int h, int ow, int oh, int quality)
++{
++    if (p->fx_ready && p->fx_effect == effect && p->fx_enc == enc && p->fx_w == w &&
++        p->fx_h == h && p->fx_ow == ow && p->fx_oh == oh)
++        return fx_apply_live(f, p, quality);
+     fx_destroy(p);
+ 
+-    if (p->sdk.CreateEffect("VideoSuperRes", &p->fx) != 0) {
+-        MP_ERR(f, "nvvfx: CreateEffect(VideoSuperRes) failed\n");
++    const char *sel = effect == EFFECT_TRUEHDR ? "TrueHDR" : "VideoSuperRes";
++    if (p->sdk.CreateEffect(sel, &p->fx) != 0) {
++        MP_ERR(f, "nvvfx: CreateEffect(%s) failed — is the SDK 1.3 runtime in libdir?\n", sel);
+         return false;
+     }
+-    // The level is set BEFORE Load, and it is the requested one. The reference implementation
+-    // always passed its upscale quality here, so its denoise setting did nothing.
+-    p->sdk.SetU32(p->fx, "QualityLevel", (unsigned)quality);
++    int in_pf = NVCV_RGBA, in_ct = NVCV_U8, out_pf = NVCV_RGBA, out_ct = NVCV_U8;
++    if (effect == EFFECT_TRUEHDR) {
++        out_pf = NVCV_RGB10A2; out_ct = NVCV_P32;
++    } else {
++        // Encoding is set BEFORE the images and Load; the SDK checks both images against it.
++        if (enc == 10) {
++            in_pf = out_pf = NVCV_RGB10A2; in_ct = out_ct = NVCV_P32;
++            if (p->sdk.SetU32(p->fx, "ImageEncodingMode", 1) != 0) {
++                MP_ERR(f, "nvvfx: ImageEncodingMode=1 (10-bit) refused\n");
++                fx_destroy(p);
++                return false;
++            }
++        }
++        // The level is set BEFORE Load, and it is the requested one. The reference implementation
++        // always passed its upscale quality here, so its denoise setting did nothing.
++        p->sdk.SetU32(p->fx, "QualityLevel", (unsigned)quality);
++    }
+ 
+-    if (p->sdk.ImageAlloc(&p->in_img, w, h, NVCV_RGBA, NVCV_U8, NVCV_CHUNKY, NVCV_GPU, 32) != 0 ||
+-        p->sdk.ImageAlloc(&p->out_img, w, h, NVCV_RGBA, NVCV_U8, NVCV_CHUNKY, NVCV_GPU, 32) != 0) {
+-        MP_ERR(f, "nvvfx: NvCVImage_Alloc %dx%d failed\n", w, h);
++    if (p->sdk.ImageAlloc(&p->in_img, w, h, in_pf, in_ct, NVCV_CHUNKY, NVCV_GPU, 32) != 0 ||
++        p->sdk.ImageAlloc(&p->out_img, ow, oh, out_pf, out_ct, NVCV_CHUNKY, NVCV_GPU, 32) != 0) {
++        MP_ERR(f, "nvvfx: NvCVImage_Alloc %dx%d -> %dx%d failed\n", w, h, ow, oh);
+         fx_destroy(p);
+         return false;
+     }
+@@ -302,14 +386,31 @@ static bool fx_ensure(struct mp_filter *f, struct priv *p, int w, int h, int qua
+         return false;
+     }
+     p->sdk.SetCudaStream(p->fx, "CudaStream", 0);
++    p->fx_effect = effect; p->fx_enc = enc; p->fx_quality = quality;
++    p->fx_strength = -1;
++    for (int n = 0; n < 5; n++)
++        p->fx_tun[n] = -1;
++    if (effect == EFFECT_TRUEHDR && !fx_apply_live(f, p, quality)) {
++        fx_destroy(p);
++        return false;
++    }
+     if (p->sdk.Load(p->fx) != 0) {
+-        MP_ERR(f, "nvvfx: NvVFX_Load failed\n");
++        MP_ERR(f, "nvvfx: NvVFX_Load(%s) failed\n", sel);
++        fx_destroy(p);
++        return false;
++    }
++    p->fx_w = w; p->fx_h = h; p->fx_ow = ow; p->fx_oh = oh; p->fx_ready = true;
++    if (effect == EFFECT_VSR && !fx_apply_live(f, p, quality)) {
+         fx_destroy(p);
+         return false;
+     }
+-    p->fx_w = w; p->fx_h = h; p->fx_quality = quality; p->fx_ready = true;
+-    MP_INFO(f, "nvvfx: %s at %dx%d, QualityLevel %d\n",
+-            quality >= 12 ? "de-blocking" : "denoise", w, h, quality);
++    if (effect == EFFECT_TRUEHDR)
++        MP_INFO(f, "nvvfx: TrueHDR at %dx%d, peak %d nits, contrast %d, saturation %d, "
++                   "middle grey %d, debanding %s\n", w, h, p->fx_tun[3], p->fx_tun[0],
++                p->fx_tun[1], p->fx_tun[2], p->fx_tun[4] ? "off" : "on");
++    else
++        MP_INFO(f, "nvvfx: VideoSuperRes %d-bit at %dx%d -> %dx%d, QualityLevel %d\n",
++                enc, w, h, ow, oh, quality);
+     return true;
+ }
+ 
+@@ -345,6 +446,10 @@ static bool cuda_ensure(struct mp_filter *f, struct priv *p, struct mp_image *mp
+         cr = r->cu->cuModuleGetFunction(&p->k_to_rgba, p->module, "yuv_to_rgba");
+     if (cr == CUDA_SUCCESS)
+         cr = r->cu->cuModuleGetFunction(&p->k_to_yuv, p->module, "rgba_to_yuv");
++    if (cr == CUDA_SUCCESS)
++        cr = r->cu->cuModuleGetFunction(&p->k_to_rgb10, p->module, "yuv_to_rgb10a2");
++    if (cr == CUDA_SUCCESS)
++        cr = r->cu->cuModuleGetFunction(&p->k_from_rgb10, p->module, "rgb10a2_to_yuv");
+     r->cu->cuCtxPopCurrent(&dummy);
+     if (cr != CUDA_SUCCESS) {
+         MP_ERR(f, "nvvfx: loading the conversion kernels failed (%d)\n", cr);
+@@ -355,11 +460,11 @@ static bool cuda_ensure(struct mp_filter *f, struct priv *p, struct mp_image *mp
+ }
+ 
+ static bool frames_ensure(struct mp_filter *f, struct priv *p, struct mp_image *mpi,
+-                          enum AVPixelFormat swfmt)
++                          int w, int h, enum AVPixelFormat swfmt)
+ {
+     if (p->frames_ref) {
+         AVHWFramesContext *fc = (void *)p->frames_ref->data;
+-        if (fc->width == mpi->w && fc->height == mpi->h && fc->sw_format == swfmt)
++        if (fc->width == w && fc->height == h && fc->sw_format == swfmt)
+             return true;
+         av_buffer_unref(&p->frames_ref);
+     }
+@@ -370,8 +475,8 @@ static bool frames_ensure(struct mp_filter *f, struct priv *p, struct mp_image *
+     AVHWFramesContext *fc = (void *)fr->data;
+     fc->format = AV_PIX_FMT_CUDA;
+     fc->sw_format = swfmt;
+-    fc->width = mpi->w;
+-    fc->height = mpi->h;
++    fc->width = w;
++    fc->height = h;
+     if (av_hwframe_ctx_init(fr) < 0) {
+         av_buffer_unref(&fr);
+         return false;
+@@ -413,8 +518,10 @@ static void process(struct mp_filter *f)
+     struct mp_image *mpi = frame.data;
+     p->frames_in++;
+ 
+-    int quality = p->opts->quality;
+-    if (quality <= 0)
++    const struct opts *o = p->opts;
++    const bool thdr = o->effect == EFFECT_TRUEHDR;
++    int quality = o->quality;
++    if (thdr ? !o->enable : quality <= 0)
+         goto passthrough;
+ 
+     if (mpi->imgfmt != IMGFMT_CUDA) {
+@@ -425,11 +532,22 @@ static void process(struct mp_filter *f)
+         }
+         goto passthrough;
+     }
+-    // Refuse HDR rather than quietly degrade it: the SDK carries roughly nine effective bits,
+-    // which is invisible in 8-bit SDR and not invisible in 10-bit PQ.
+-    if (pl_color_space_is_hdr(&mpi->params.color)) {
++    const bool hdr_in = pl_color_space_is_hdr(&mpi->params.color);
++    // TrueHDR expands SDR; an HDR source already is HDR and must not be expanded twice.
++    if (thdr && hdr_in) {
++        if (!p->warned_thdr_hdr) {
++            MP_INFO(f, "nvvfx: TrueHDR declines an HDR source (already HDR). Passing through.\n");
++            p->warned_thdr_hdr = true;
++        }
++        goto passthrough;
++    }
++    // The 8-bit VSR path declines HDR rather than quietly degrade it: it carries roughly nine
++    // effective bits, invisible in 8-bit SDR and not invisible in 10-bit PQ. encoding=10 is the
++    // path for HDR (F-R384: no 8-bit grid).
++    int enc = thdr ? 8 : (o->encoding == 10 ? 10 : 8);
++    if (!thdr && enc == 8 && hdr_in) {
+         if (!p->warned_hdr) {
+-            MP_INFO(f, "nvvfx: HDR input — declining (the effect is 8-bit internally). "
++            MP_INFO(f, "nvvfx: HDR input on the 8-bit path — declining. Use encoding=10. "
+                        "Passing through untouched.\n");
+             p->warned_hdr = true;
+         }
+@@ -444,18 +562,33 @@ static void process(struct mp_filter *f)
+         }
+         goto passthrough;
+     }
++    // Denoise/deblur and the other restoration levels are 1:1 (SDK rule); only 1-4 upscale.
++    int scale = 1;
++    if (!thdr && o->scale == 2) {
++        if (quality >= 1 && quality <= 4) {
++            scale = 2;
++        } else if (!p->warned_scale) {
++            MP_WARN(f, "nvvfx: scale=2 needs quality 1-4 (upscale levels); level %d runs 1:1\n",
++                    quality);
++            p->warned_scale = true;
++        }
++    }
+ 
+     if (!p->sdk_tried) {
+         p->sdk_tried = true;
+-        p->sdk_ok = sdk_load(f, &p->sdk, p->opts->libdir);
++        p->sdk_ok = sdk_load(f, &p->sdk, o->libdir);
+     }
+     if (!p->sdk_ok)
+         goto passthrough;
+     if (!cuda_ensure(f, p, mpi))
+         goto passthrough;
+ 
+-    enum AVPixelFormat swfmt = imgfmt2pixfmt(subfmt);
+-    if (swfmt == AV_PIX_FMT_NONE || !frames_ensure(f, p, mpi, swfmt))
++    int w = mpi->w, h = mpi->h, ow = w * scale, oh = h * scale;
++    // Output format: TrueHDR and the 10-bit path always leave as P010 (10-bit data must not be
++    // squeezed back into NV12); the 8-bit path keeps the input's own format.
++    int out_subfmt = (thdr || enc == 10) ? IMGFMT_P010 : subfmt;
++    enum AVPixelFormat swfmt = imgfmt2pixfmt(out_subfmt);
++    if (swfmt == AV_PIX_FMT_NONE || !frames_ensure(f, p, mpi, ow, oh, swfmt))
+         goto passthrough;
+ 
+     CudaFunctions *cu = p->ref->cu;
+@@ -463,15 +596,15 @@ static void process(struct mp_filter *f)
+     if (cu->cuCtxPushCurrent(p->ref->ctx) != CUDA_SUCCESS)
+         goto passthrough;
+ 
+-    if (!fx_ensure(f, p, mpi->w, mpi->h, quality)) {
++    if (!fx_ensure(f, p, o->effect, enc, w, h, ow, oh, quality)) {
+         cu->cuCtxPopCurrent(&dummy);
+         goto passthrough;
+     }
+ 
+-    // Output allocation, laid out exactly like the input's software format.
++    // Output allocation, laid out exactly like the output software format.
+     struct mp_image sw = {0};
+-    mp_image_setfmt(&sw, subfmt);
+-    mp_image_set_size(&sw, mpi->w, mpi->h);
++    mp_image_setfmt(&sw, out_subfmt);
++    mp_image_set_size(&sw, ow, oh);
+     int nplanes = sw.fmt.num_planes;
+     size_t rowbytes[MP_MAX_PLANES], rows[MP_MAX_PLANES], pitch[MP_MAX_PLANES];
+     size_t off[MP_MAX_PLANES], total = 0;
+@@ -491,21 +624,20 @@ static void process(struct mp_filter *f)
+         goto passthrough;
+     }
+ 
+-    int depth16 = (subfmt == IMGFMT_P010) ? 1 : 0;
+-    int limited = mpi->params.repr.levels != PL_COLOR_LEVELS_FULL;
++    // In: the decoder's own coding.
++    int in16 = (subfmt == IMGFMT_P010) ? 1 : 0;
++    int in_limited = mpi->params.repr.levels != PL_COLOR_LEVELS_FULL;
+     float kr, kb;
+     matrix_coeffs(mpi, &kr, &kb);
+-    int w = mpi->w, h = mpi->h;
+ 
+     void *src_y = mpi->planes[0], *src_uv = mpi->planes[1];
+     int s_yp = mpi->stride[0], s_uvp = mpi->stride[1];
+-    void *rgba_in = p->in_img.pixels;
+-    int rgba_pitch = p->in_img.pitch;
+-
+-    void *args1[] = { &src_y, &s_yp, &src_uv, &s_uvp, &rgba_in, &rgba_pitch,
+-                      &w, &h, &depth16, &limited, &kr, &kb };
+-    unsigned gx = (w + 15) / 16, gy = (h + 15) / 16;
+-    cr = cu->cuLaunchKernel(p->k_to_rgba, gx, gy, 1, 16, 16, 1, 0, 0, args1, NULL);
++    void *rgb_in = p->in_img.pixels;
++    int rgb_in_pitch = p->in_img.pitch;
++    void *args1[] = { &src_y, &s_yp, &src_uv, &s_uvp, &rgb_in, &rgb_in_pitch,
++                      &w, &h, &in16, &in_limited, &kr, &kb };
++    CUfunction k_in = enc == 10 ? p->k_to_rgb10 : p->k_to_rgba;
++    cr = cu->cuLaunchKernel(k_in, (w + 15) / 16, (h + 15) / 16, 1, 16, 16, 1, 0, 0, args1, NULL);
+ 
+     if (cr == CUDA_SUCCESS && p->sdk.Run(p->fx, 0) != 0) {
+         MP_WARN(f, "nvvfx: NvVFX_Run failed; passing the frame through\n");
+@@ -516,16 +648,27 @@ static void process(struct mp_filter *f)
+     if (cr == CUDA_SUCCESS)
+         p->sdk.GetImage(p->fx, "DstImage0", &p->out_img);
+ 
+-    void *rgba_out = p->out_img.pixels;
+-    int rgba_out_pitch = p->out_img.pitch;
++    // Out: TrueHDR writes full-range PQ R'G'B' in BT.2020 primaries, which goes to limited-range
++    // BT.2020-NCL P010 like an HDR10 disc. Every other path returns to the input's own coding.
++    int out16 = (out_subfmt == IMGFMT_P010) ? 1 : 0;
++    int out_limited = thdr ? 1 : in_limited;
++    float okr = kr, okb = kb;
++    if (thdr) {
++        okr = 0.2627f;
++        okb = 0.0593f;
++    }
++    void *rgb_out = p->out_img.pixels;
++    int rgb_out_pitch = p->out_img.pitch;
+     void *dst_y = (void *)(uintptr_t)(mem + off[0]);
+     void *dst_uv = (void *)(uintptr_t)(mem + off[1]);
+     int d_yp = (int)pitch[0], d_uvp = (int)pitch[1];
+-    void *args2[] = { &rgba_out, &rgba_out_pitch, &dst_y, &d_yp, &dst_uv, &d_uvp,
+-                      &w, &h, &depth16, &limited, &kr, &kb };
++    void *args2[] = { &rgb_out, &rgb_out_pitch, &dst_y, &d_yp, &dst_uv, &d_uvp,
++                      &ow, &oh, &out16, &out_limited, &okr, &okb };
++    CUfunction k_out = (thdr || enc == 10) ? p->k_from_rgb10 : p->k_to_yuv;
+     if (cr == CUDA_SUCCESS)
+-        cr = cu->cuLaunchKernel(p->k_to_yuv, gx, gy, 1, 16, 16, 1, 0, 0, args2, NULL);
+-    if (cr == CUDA_SUCCESS && p->opts->sync)
++        cr = cu->cuLaunchKernel(k_out, (ow + 15) / 16, (oh + 15) / 16, 1, 16, 16, 1, 0, 0,
++                                args2, NULL);
++    if (cr == CUDA_SUCCESS && o->sync)
+         cr = cu->cuStreamSynchronize(0);
+     int64_t t1 = mp_time_ns();
+ 
+@@ -551,9 +694,9 @@ static void process(struct mp_filter *f)
+     atomic_fetch_add(&p->ref->refs, 1);
+ 
+     struct mp_image tmpl = {0};
+-    mp_image_sethwfmt(&tmpl, IMGFMT_CUDA, subfmt);
+-    tmpl.params.hw_subfmt = subfmt;
+-    mp_image_set_size(&tmpl, w, h);
++    mp_image_sethwfmt(&tmpl, IMGFMT_CUDA, out_subfmt);
++    tmpl.params.hw_subfmt = out_subfmt;
++    mp_image_set_size(&tmpl, ow, oh);
+     for (int n = 0; n < nplanes; n++) {
+         tmpl.planes[n] = (uint8_t *)(uintptr_t)(mem + off[n]);
+         tmpl.stride[n] = pitch[n];
+@@ -565,14 +708,35 @@ static void process(struct mp_filter *f)
+     }
+     out->hwctx = av_buffer_ref(p->frames_ref);
+     mp_image_copy_attributes(out, mpi);
++    if (scale != 1) {
++        // copy_attributes carries the source crop, which is in source pixels.
++        out->params.crop.x0 *= scale;
++        out->params.crop.y0 *= scale;
++        out->params.crop.x1 *= scale;
++        out->params.crop.y1 *= scale;
++    }
++    if (thdr) {
++        // Tag it as an HDR10 disc would be: BT.2020 / PQ / BT.2020-NCL limited, with the peak the
++        // network was asked to target, so libplacebo maps it to the display rather than to a
++        // guessed 1000 nits (F-R83).
++        out->params.color.primaries = PL_COLOR_PRIM_BT_2020;
++        out->params.color.transfer = PL_COLOR_TRC_PQ;
++        out->params.color.hdr = pl_hdr_metadata_empty;
++        out->params.color.hdr.min_luma = 0.0001f;
++        out->params.color.hdr.max_luma = (float)p->fx_tun[3];
++        out->params.color.hdr.max_cll = (float)p->fx_tun[3];
++        out->params.repr.sys = PL_COLOR_SYSTEM_BT_2020_NC;
++        out->params.repr.levels = PL_COLOR_LEVELS_LIMITED;
++        out->params.repr.bits = (struct pl_bit_encoding){0};
++    }
+ 
+     p->frames_done++;
+     p->ms_sum += (double)(t1 - t0);
+-    if (p->opts->log_every > 0 && p->frames_done % p->opts->log_every == 0) {
+-        MP_VERBOSE(f, "nvvfx: %"PRId64" frames, QualityLevel %d, %s %dx%d, mean %.3f ms/frame%s\n",
+-                   p->frames_done, p->fx_quality, mp_imgfmt_to_name(subfmt), w, h,
+-                   p->ms_sum / p->frames_done / 1e6,
+-                   p->opts->sync ? " (synced)" : " (async)");
++    if (o->log_every > 0 && p->frames_done % o->log_every == 0) {
++        MP_VERBOSE(f, "nvvfx: %"PRId64" frames, %s, %s %dx%d -> %s %dx%d, mean %.3f ms/frame%s\n",
++                   p->frames_done, thdr ? "TrueHDR" : "VSR", mp_imgfmt_to_name(subfmt), w, h,
++                   mp_imgfmt_to_name(out_subfmt), ow, oh, p->ms_sum / p->frames_done / 1e6,
++                   o->sync ? " (synced)" : " (async)");
+     }
+ 
+     mp_frame_unref(&frame);
+@@ -583,17 +747,69 @@ passthrough:
+     mp_pin_in_write(f->ppins[1], frame);
+ }
+ 
++// Live controls, picked up on the next frame with no graph rebuild and no SDK reload (the SDK
++// accepts QualityLevel, Strength and the TrueHDR tunables after Load). One player, one filter:
++// no shared control files (F-R390).
++static bool set_int_cmd(struct mp_filter *f, const char *name, const char *arg, int lo, int hi,
++                        int *dst)
++{
++    char *end = NULL;
++    long v = strtol(arg ? arg : "", &end, 10);
++    if (!arg || end == arg || v < lo || v > hi) {
++        MP_WARN(f, "nvvfx: %s must be %d..%d\n", name, lo, hi);
++        return false;
++    }
++    *dst = (int)v;
++    MP_INFO(f, "nvvfx: %s=%d (live)\n", name, *dst);
++    return true;
++}
++
+ static bool command(struct mp_filter *f, struct mp_filter_command *cmd)
+ {
+     struct priv *p = f->priv;
++    struct opts *o = p->opts;
+     if (cmd->type != MP_FILTER_COMMAND_TEXT)
+         return false;
++    const char *a = cmd->arg;
+     if (!strcmp(cmd->cmd, "quality")) {
+-        int q = atoi(cmd->arg ? cmd->arg : "0");
+-        if (q < 0 || q > 15)
++        int q;
++        if (!set_int_cmd(f, "quality", a, 0, 23, &q))
++            return false;
++        if ((q >= 5 && q <= 7) || q == 20 || q == 22) {
++            MP_WARN(f, "nvvfx: quality %d is not an SDK level (0-4, 8-19, 21, 23)\n", q);
++            return false;
++        }
++        o->quality = q;
++        return true;
++    }
++    if (!strcmp(cmd->cmd, "strength")) {
++        double v = a ? atof(a) : -1;
++        if (v < 0 || v > 1)
++            return false;
++        o->strength = (float)v;
++        MP_INFO(f, "nvvfx: strength=%.2f (live)\n", v);
++        return true;
++    }
++    if (!strcmp(cmd->cmd, "enable")) {
++        int e;
++        if (!set_int_cmd(f, "enable", a, 0, 1, &e))
++            return false;
++        o->enable = e != 0;
++        return true;
++    }
++    if (!strcmp(cmd->cmd, "contrast"))
++        return set_int_cmd(f, "contrast", a, 0, 200, &o->contrast);
++    if (!strcmp(cmd->cmd, "saturation"))
++        return set_int_cmd(f, "saturation", a, 0, 200, &o->saturation);
++    if (!strcmp(cmd->cmd, "middlegray"))
++        return set_int_cmd(f, "middlegray", a, 10, 100, &o->middlegray);
++    if (!strcmp(cmd->cmd, "luminance"))
++        return set_int_cmd(f, "luminance", a, 400, 2000, &o->luminance);
++    if (!strcmp(cmd->cmd, "debanding")) {
++        int d;
++        if (!set_int_cmd(f, "debanding", a, 0, 1, &d))
+             return false;
+-        p->opts->quality = q;      // picked up on the next frame, no graph rebuild
+-        MP_INFO(f, "nvvfx: quality=%d (live)\n", q);
++        o->debanding = d != 0;
+         return true;
+     }
+     if (!strcmp(cmd->cmd, "stats")) {
+@@ -644,13 +860,25 @@ static struct mp_filter *vf_nvvfx_create(struct mp_filter *parent, void *options
+     p->opts = talloc_steal(p, options);
+     mp_filter_add_pin(f, MP_PIN_IN, "in");
+     mp_filter_add_pin(f, MP_PIN_OUT, "out");
+-    MP_VERBOSE(f, "nvvfx: created (quality=%d libdir=%s)\n", p->opts->quality, p->opts->libdir);
++    MP_VERBOSE(f, "nvvfx: created (effect=%s quality=%d encoding=%d libdir=%s)\n",
++               p->opts->effect == EFFECT_TRUEHDR ? "truehdr" : "vsr", p->opts->quality,
++               p->opts->encoding, p->opts->libdir);
+     return f;
+ }
+ 
+ #define OPT_BASE_STRUCT struct opts
+ static const m_option_t vf_opts_fields[] = {
+-    {"quality", OPT_INT(quality), M_RANGE(0, 15)},
++    {"effect", OPT_CHOICE(effect, {"vsr", EFFECT_VSR}, {"truehdr", EFFECT_TRUEHDR})},
++    {"quality", OPT_INT(quality), M_RANGE(0, 23)},
++    {"strength", OPT_FLOAT(strength), M_RANGE(-1, 1)},
++    {"encoding", OPT_CHOICE(encoding, {"8", 8}, {"10", 10})},
++    {"scale", OPT_INT(scale), M_RANGE(1, 2)},
++    {"contrast", OPT_INT(contrast), M_RANGE(0, 200)},
++    {"saturation", OPT_INT(saturation), M_RANGE(0, 200)},
++    {"middlegray", OPT_INT(middlegray), M_RANGE(10, 100)},
++    {"luminance", OPT_INT(luminance), M_RANGE(400, 2000)},
++    {"debanding", OPT_BOOL(debanding)},
++    {"enable", OPT_BOOL(enable)},
+     {"libdir", OPT_STRING(libdir)},
+     {"sync", OPT_BOOL(sync)},
+     {"log-every", OPT_INT(log_every), M_RANGE(0, 1000000)},
+@@ -659,12 +887,24 @@ static const m_option_t vf_opts_fields[] = {
+ 
+ const struct mp_user_filter_entry vf_nvvfx = {
+     .desc = {
+-        .description = "NVIDIA Video Effects denoise / de-blocking (GPU resident)",
++        .description = "NVIDIA Video Effects: VSR / denoise / deblur and TrueHDR (GPU resident)",
+         .name = "nvvfx",
+         .priv_size = sizeof(OPT_BASE_STRUCT),
+         .priv_defaults = &(const OPT_BASE_STRUCT){
++            .effect = EFFECT_VSR,
+             .quality = 0,
+-            .libdir = "C:\\Apps\\mpv-ai\\Lib\\site-packages\\nvvfx\\libs",
++            .strength = -1,
++            .encoding = 8,
++            .scale = 1,
++            // NVIDIA's TrueHDR defaults, except the peak: 1000 rather than 650, since the LG
++            // reports ~1499 nits (F-R80); set it per display with luminance=.
++            .contrast = 100,
++            .saturation = 100,
++            .middlegray = 50,
++            .luminance = 1000,
++            .debanding = true,
++            .enable = true,
++            .libdir = "C:\\Apps\\mpv-ai\\bench\\nvvfx_020\\nvvfx\\libs",
+             .sync = false,
+             .log_every = 120,
+         },
+diff --git a/video/filter/vf_nvvfx_ptx.h b/video/filter/vf_nvvfx_ptx.h
+index 36388b7..6f1c350 100644
+--- a/video/filter/vf_nvvfx_ptx.h
++++ b/video/filter/vf_nvvfx_ptx.h
+@@ -1,8 +1,9 @@
+-// Generated from bench/cudapass/vpg_convert.cu by NVRTC (--gpu-architecture=compute_75).
+-// PTX rather than a cubin so the driver JITs it forward to any newer GPU; embedded rather than
+-// compiled at runtime so the filter needs neither NVRTC (~97 MB) nor a CUDA toolkit in the build.
+-// Verified numerically against an independent reference before embedding: all four
+-// format/matrix combinations within rounding, and limited-range black/white land on 0/255.
++// Generated from bench/cudapass/vpg_convert.cu by NVRTC (--gpu-architecture=compute_75), via
++// bench/cudapass/nvrtc_ptx.py and embed_ptx.py. Revision 2 (2026-10-03) adds yuv_to_rgb10a2 and
++// rgb10a2_to_yuv. PTX rather than a cubin so the driver JITs it forward to any newer GPU; embedded
++// rather than compiled at runtime so the filter needs neither NVRTC (~97 MB) nor a CUDA toolkit in
++// the build. Verified numerically against an independent reference before embedding
++// (bench/cudapass/kernel_check_v2.py).
+ #pragma once
+ 
+ static const char vpg_convert_ptx[] =
+@@ -18,473 +19,942 @@ static const char vpg_convert_ptx[] =
+     ".target sm_75\n"
+     ".address_size 64\n"
+     "\n"
+-    "\t// .globl\tyuv_to_rgba\n"
++    "	// .globl	yuv_to_rgba\n"
+     "\n"
+     ".visible .entry yuv_to_rgba(\n"
+-    "\t.param .u64 yuv_to_rgba_param_0,\n"
+-    "\t.param .u32 yuv_to_rgba_param_1,\n"
+-    "\t.param .u64 yuv_to_rgba_param_2,\n"
+-    "\t.param .u32 yuv_to_rgba_param_3,\n"
+-    "\t.param .u64 yuv_to_rgba_param_4,\n"
+-    "\t.param .u32 yuv_to_rgba_param_5,\n"
+-    "\t.param .u32 yuv_to_rgba_param_6,\n"
+-    "\t.param .u32 yuv_to_rgba_param_7,\n"
+-    "\t.param .u32 yuv_to_rgba_param_8,\n"
+-    "\t.param .u32 yuv_to_rgba_param_9,\n"
+-    "\t.param .f32 yuv_to_rgba_param_10,\n"
+-    "\t.param .f32 yuv_to_rgba_param_11\n"
++    "	.param .u64 yuv_to_rgba_param_0,\n"
++    "	.param .u32 yuv_to_rgba_param_1,\n"
++    "	.param .u64 yuv_to_rgba_param_2,\n"
++    "	.param .u32 yuv_to_rgba_param_3,\n"
++    "	.param .u64 yuv_to_rgba_param_4,\n"
++    "	.param .u32 yuv_to_rgba_param_5,\n"
++    "	.param .u32 yuv_to_rgba_param_6,\n"
++    "	.param .u32 yuv_to_rgba_param_7,\n"
++    "	.param .u32 yuv_to_rgba_param_8,\n"
++    "	.param .u32 yuv_to_rgba_param_9,\n"
++    "	.param .f32 yuv_to_rgba_param_10,\n"
++    "	.param .f32 yuv_to_rgba_param_11\n"
+     ")\n"
+     "{\n"
+-    "\t.reg .pred \t%p<16>;\n"
+-    "\t.reg .b16 \t%rs<8>;\n"
+-    "\t.reg .f32 \t%f<65>;\n"
+-    "\t.reg .b32 \t%r<29>;\n"
+-    "\t.reg .b64 \t%rd<19>;\n"
+-    "\n"
+-    "\n"
+-    "\tld.param.u64 \t%rd4, [yuv_to_rgba_param_0];\n"
+-    "\tld.param.u32 \t%r5, [yuv_to_rgba_param_1];\n"
+-    "\tld.param.u64 \t%rd5, [yuv_to_rgba_param_2];\n"
+-    "\tld.param.u32 \t%r6, [yuv_to_rgba_param_3];\n"
+-    "\tld.param.u64 \t%rd3, [yuv_to_rgba_param_4];\n"
+-    "\tld.param.u32 \t%r7, [yuv_to_rgba_param_5];\n"
+-    "\tld.param.u32 \t%r10, [yuv_to_rgba_param_6];\n"
+-    "\tld.param.u32 \t%r11, [yuv_to_rgba_param_7];\n"
+-    "\tld.param.u32 \t%r8, [yuv_to_rgba_param_8];\n"
+-    "\tld.param.u32 \t%r9, [yuv_to_rgba_param_9];\n"
+-    "\tld.param.f32 \t%f19, [yuv_to_rgba_param_10];\n"
+-    "\tld.param.f32 \t%f20, [yuv_to_rgba_param_11];\n"
+-    "\tcvta.to.global.u64 \t%rd1, %rd5;\n"
+-    "\tcvta.to.global.u64 \t%rd2, %rd4;\n"
+-    "\tmov.u32 \t%r12, %ntid.x;\n"
+-    "\tmov.u32 \t%r13, %ctaid.x;\n"
+-    "\tmov.u32 \t%r14, %tid.x;\n"
+-    "\tmad.lo.s32 \t%r1, %r13, %r12, %r14;\n"
+-    "\tmov.u32 \t%r15, %ntid.y;\n"
+-    "\tmov.u32 \t%r16, %ctaid.y;\n"
+-    "\tmov.u32 \t%r17, %tid.y;\n"
+-    "\tmad.lo.s32 \t%r2, %r16, %r15, %r17;\n"
+-    "\tsetp.ge.s32 \t%p1, %r1, %r10;\n"
+-    "\tsetp.ge.s32 \t%p2, %r2, %r11;\n"
+-    "\tor.pred  \t%p3, %p1, %p2;\n"
+-    "\t@%p3 bra \t$L__BB0_8;\n"
+-    "\n"
+-    "\tand.b32  \t%r3, %r1, -2;\n"
+-    "\tshr.s32 \t%r4, %r2, 1;\n"
+-    "\tsetp.eq.s32 \t%p4, %r8, 0;\n"
+-    "\t@%p4 bra \t$L__BB0_3;\n"
+-    "\n"
+-    "\tshr.s32 \t%r18, %r5, 1;\n"
+-    "\tmad.lo.s32 \t%r19, %r18, %r2, %r1;\n"
+-    "\tmul.wide.s32 \t%rd6, %r19, 2;\n"
+-    "\tadd.s64 \t%rd7, %rd2, %rd6;\n"
+-    "\tld.global.u16 \t%rs1, [%rd7];\n"
+-    "\tcvt.rn.f32.u16 \t%f59, %rs1;\n"
+-    "\tshr.s32 \t%r20, %r6, 1;\n"
+-    "\tmad.lo.s32 \t%r21, %r20, %r4, %r3;\n"
+-    "\tmul.wide.s32 \t%rd8, %r21, 2;\n"
+-    "\tadd.s64 \t%rd9, %rd1, %rd8;\n"
+-    "\tld.global.u16 \t%rs2, [%rd9];\n"
+-    "\tcvt.rn.f32.u16 \t%f60, %rs2;\n"
+-    "\tld.global.u16 \t%rs3, [%rd9+2];\n"
+-    "\tcvt.rn.f32.u16 \t%f61, %rs3;\n"
+-    "\tbra.uni \t$L__BB0_4;\n"
++    "	.reg .pred 	%p<16>;\n"
++    "	.reg .b16 	%rs<8>;\n"
++    "	.reg .f32 	%f<65>;\n"
++    "	.reg .b32 	%r<29>;\n"
++    "	.reg .b64 	%rd<19>;\n"
++    "\n"
++    "\n"
++    "	ld.param.u64 	%rd4, [yuv_to_rgba_param_0];\n"
++    "	ld.param.u32 	%r5, [yuv_to_rgba_param_1];\n"
++    "	ld.param.u64 	%rd5, [yuv_to_rgba_param_2];\n"
++    "	ld.param.u32 	%r6, [yuv_to_rgba_param_3];\n"
++    "	ld.param.u64 	%rd3, [yuv_to_rgba_param_4];\n"
++    "	ld.param.u32 	%r7, [yuv_to_rgba_param_5];\n"
++    "	ld.param.u32 	%r10, [yuv_to_rgba_param_6];\n"
++    "	ld.param.u32 	%r11, [yuv_to_rgba_param_7];\n"
++    "	ld.param.u32 	%r8, [yuv_to_rgba_param_8];\n"
++    "	ld.param.u32 	%r9, [yuv_to_rgba_param_9];\n"
++    "	ld.param.f32 	%f19, [yuv_to_rgba_param_10];\n"
++    "	ld.param.f32 	%f20, [yuv_to_rgba_param_11];\n"
++    "	cvta.to.global.u64 	%rd1, %rd5;\n"
++    "	cvta.to.global.u64 	%rd2, %rd4;\n"
++    "	mov.u32 	%r12, %ntid.x;\n"
++    "	mov.u32 	%r13, %ctaid.x;\n"
++    "	mov.u32 	%r14, %tid.x;\n"
++    "	mad.lo.s32 	%r1, %r13, %r12, %r14;\n"
++    "	mov.u32 	%r15, %ntid.y;\n"
++    "	mov.u32 	%r16, %ctaid.y;\n"
++    "	mov.u32 	%r17, %tid.y;\n"
++    "	mad.lo.s32 	%r2, %r16, %r15, %r17;\n"
++    "	setp.ge.s32 	%p1, %r1, %r10;\n"
++    "	setp.ge.s32 	%p2, %r2, %r11;\n"
++    "	or.pred  	%p3, %p1, %p2;\n"
++    "	@%p3 bra 	$L__BB0_8;\n"
++    "\n"
++    "	and.b32  	%r3, %r1, -2;\n"
++    "	shr.s32 	%r4, %r2, 1;\n"
++    "	setp.eq.s32 	%p4, %r8, 0;\n"
++    "	@%p4 bra 	$L__BB0_3;\n"
++    "\n"
++    "	shr.s32 	%r18, %r5, 1;\n"
++    "	mad.lo.s32 	%r19, %r18, %r2, %r1;\n"
++    "	mul.wide.s32 	%rd6, %r19, 2;\n"
++    "	add.s64 	%rd7, %rd2, %rd6;\n"
++    "	ld.global.u16 	%rs1, [%rd7];\n"
++    "	cvt.rn.f32.u16 	%f59, %rs1;\n"
++    "	shr.s32 	%r20, %r6, 1;\n"
++    "	mad.lo.s32 	%r21, %r20, %r4, %r3;\n"
++    "	mul.wide.s32 	%rd8, %r21, 2;\n"
++    "	add.s64 	%rd9, %rd1, %rd8;\n"
++    "	ld.global.u16 	%rs2, [%rd9];\n"
++    "	cvt.rn.f32.u16 	%f60, %rs2;\n"
++    "	ld.global.u16 	%rs3, [%rd9+2];\n"
++    "	cvt.rn.f32.u16 	%f61, %rs3;\n"
++    "	bra.uni 	$L__BB0_4;\n"
+     "\n"
+     "$L__BB0_3:\n"
+-    "\tmad.lo.s32 \t%r22, %r2, %r5, %r1;\n"
+-    "\tcvt.s64.s32 \t%rd10, %r22;\n"
+-    "\tadd.s64 \t%rd11, %rd2, %rd10;\n"
+-    "\tld.global.u8 \t%rs4, [%rd11];\n"
+-    "\tcvt.rn.f32.u16 \t%f59, %rs4;\n"
+-    "\tmad.lo.s32 \t%r23, %r4, %r6, %r3;\n"
+-    "\tcvt.s64.s32 \t%rd12, %r23;\n"
+-    "\tadd.s64 \t%rd13, %rd1, %rd12;\n"
+-    "\tld.global.u8 \t%rs5, [%rd13];\n"
+-    "\tcvt.rn.f32.u16 \t%f60, %rs5;\n"
+-    "\tld.global.u8 \t%rs6, [%rd13+1];\n"
+-    "\tcvt.rn.f32.u16 \t%f61, %rs6;\n"
++    "	mad.lo.s32 	%r22, %r2, %r5, %r1;\n"
++    "	cvt.s64.s32 	%rd10, %r22;\n"
++    "	add.s64 	%rd11, %rd2, %rd10;\n"
++    "	ld.global.u8 	%rs4, [%rd11];\n"
++    "	cvt.rn.f32.u16 	%f59, %rs4;\n"
++    "	mad.lo.s32 	%r23, %r4, %r6, %r3;\n"
++    "	cvt.s64.s32 	%rd12, %r23;\n"
++    "	add.s64 	%rd13, %rd1, %rd12;\n"
++    "	ld.global.u8 	%rs5, [%rd13];\n"
++    "	cvt.rn.f32.u16 	%f60, %rs5;\n"
++    "	ld.global.u8 	%rs6, [%rd13+1];\n"
++    "	cvt.rn.f32.u16 	%f61, %rs6;\n"
+     "\n"
+     "$L__BB0_4:\n"
+-    "\tsetp.eq.s32 \t%p5, %r9, 0;\n"
+-    "\t@%p5 bra \t$L__BB0_6;\n"
+-    "\n"
+-    "\tsetp.ne.s32 \t%p6, %r8, 0;\n"
+-    "\tselp.f32 \t%f21, 0f45800000, 0f41800000, %p6;\n"
+-    "\tselp.f32 \t%f22, 0f435B0000, 0f475B0000, %p4;\n"
+-    "\tselp.f32 \t%f23, 0f43000000, 0f47000000, %p4;\n"
+-    "\tselp.f32 \t%f24, 0f43600000, 0f47600000, %p4;\n"
+-    "\tsub.f32 \t%f25, %f59, %f21;\n"
+-    "\tdiv.rn.f32 \t%f62, %f25, %f22;\n"
+-    "\tsub.f32 \t%f26, %f60, %f23;\n"
+-    "\tdiv.rn.f32 \t%f63, %f26, %f24;\n"
+-    "\tsub.f32 \t%f27, %f61, %f23;\n"
+-    "\tdiv.rn.f32 \t%f64, %f27, %f24;\n"
+-    "\tbra.uni \t$L__BB0_7;\n"
++    "	setp.eq.s32 	%p5, %r9, 0;\n"
++    "	@%p5 bra 	$L__BB0_6;\n"
++    "\n"
++    "	setp.ne.s32 	%p6, %r8, 0;\n"
++    "	selp.f32 	%f21, 0f45800000, 0f41800000, %p6;\n"
++    "	selp.f32 	%f22, 0f435B0000, 0f475B0000, %p4;\n"
++    "	selp.f32 	%f23, 0f43000000, 0f47000000, %p4;\n"
++    "	selp.f32 	%f24, 0f43600000, 0f47600000, %p4;\n"
++    "	sub.f32 	%f25, %f59, %f21;\n"
++    "	div.rn.f32 	%f62, %f25, %f22;\n"
++    "	sub.f32 	%f26, %f60, %f23;\n"
++    "	div.rn.f32 	%f63, %f26, %f24;\n"
++    "	sub.f32 	%f27, %f61, %f23;\n"
++    "	div.rn.f32 	%f64, %f27, %f24;\n"
++    "	bra.uni 	$L__BB0_7;\n"
+     "\n"
+     "$L__BB0_6:\n"
+-    "\tsetp.ne.s32 \t%p8, %r8, 0;\n"
+-    "\tselp.f32 \t%f28, 0f477FFF00, 0f437F0000, %p8;\n"
+-    "\tselp.f32 \t%f29, 0f43000000, 0f47000000, %p4;\n"
+-    "\tdiv.rn.f32 \t%f62, %f59, %f28;\n"
+-    "\tsub.f32 \t%f30, %f60, %f29;\n"
+-    "\tdiv.rn.f32 \t%f63, %f30, %f28;\n"
+-    "\tsub.f32 \t%f31, %f61, %f29;\n"
+-    "\tdiv.rn.f32 \t%f64, %f31, %f28;\n"
++    "	setp.ne.s32 	%p8, %r8, 0;\n"
++    "	selp.f32 	%f28, 0f477FFF00, 0f437F0000, %p8;\n"
++    "	selp.f32 	%f29, 0f43000000, 0f47000000, %p4;\n"
++    "	div.rn.f32 	%f62, %f59, %f28;\n"
++    "	sub.f32 	%f30, %f60, %f29;\n"
++    "	div.rn.f32 	%f63, %f30, %f28;\n"
++    "	sub.f32 	%f31, %f61, %f29;\n"
++    "	div.rn.f32 	%f64, %f31, %f28;\n"
+     "\n"
+     "$L__BB0_7:\n"
+-    "\tmov.f32 \t%f32, 0f3F800000;\n"
+-    "\tsub.f32 \t%f33, %f32, %f19;\n"
+-    "\tsub.f32 \t%f34, %f33, %f20;\n"
+-    "\tadd.f32 \t%f35, %f33, %f33;\n"
+-    "\tfma.rn.f32 \t%f36, %f35, %f64, %f62;\n"
+-    "\tadd.f32 \t%f37, %f19, %f19;\n"
+-    "\tmul.f32 \t%f38, %f37, %f33;\n"
+-    "\tdiv.rn.f32 \t%f39, %f38, %f34;\n"
+-    "\tmul.f32 \t%f40, %f39, %f64;\n"
+-    "\tsub.f32 \t%f41, %f62, %f40;\n"
+-    "\tsub.f32 \t%f42, %f32, %f20;\n"
+-    "\tadd.f32 \t%f43, %f20, %f20;\n"
+-    "\tmul.f32 \t%f44, %f43, %f42;\n"
+-    "\tdiv.rn.f32 \t%f45, %f44, %f34;\n"
+-    "\tmul.f32 \t%f46, %f45, %f63;\n"
+-    "\tsub.f32 \t%f47, %f41, %f46;\n"
+-    "\tadd.f32 \t%f48, %f42, %f42;\n"
+-    "\tfma.rn.f32 \t%f49, %f48, %f63, %f62;\n"
+-    "\tmul.lo.s32 \t%r24, %r2, %r7;\n"
+-    "\tcvt.s64.s32 \t%rd14, %r24;\n"
+-    "\tshl.b32 \t%r25, %r1, 2;\n"
+-    "\tcvt.s64.s32 \t%rd15, %r25;\n"
+-    "\tadd.s64 \t%rd16, %rd14, %rd15;\n"
+-    "\tcvta.to.global.u64 \t%rd17, %rd3;\n"
+-    "\tadd.s64 \t%rd18, %rd17, %rd16;\n"
+-    "\tsetp.lt.f32 \t%p10, %f36, 0f00000000;\n"
+-    "\tsetp.gt.f32 \t%p11, %f36, 0f3F800000;\n"
+-    "\tselp.f32 \t%f50, 0f3F800000, %f36, %p11;\n"
+-    "\tfma.rn.f32 \t%f51, %f50, 0f437F0000, 0f3F000000;\n"
+-    "\tselp.f32 \t%f52, 0f3F000000, %f51, %p10;\n"
+-    "\tcvt.rzi.u32.f32 \t%r26, %f52;\n"
+-    "\tst.global.u8 \t[%rd18], %r26;\n"
+-    "\tsetp.lt.f32 \t%p12, %f47, 0f00000000;\n"
+-    "\tsetp.gt.f32 \t%p13, %f47, 0f3F800000;\n"
+-    "\tselp.f32 \t%f53, 0f3F800000, %f47, %p13;\n"
+-    "\tfma.rn.f32 \t%f54, %f53, 0f437F0000, 0f3F000000;\n"
+-    "\tselp.f32 \t%f55, 0f3F000000, %f54, %p12;\n"
+-    "\tcvt.rzi.u32.f32 \t%r27, %f55;\n"
+-    "\tst.global.u8 \t[%rd18+1], %r27;\n"
+-    "\tsetp.lt.f32 \t%p14, %f49, 0f00000000;\n"
+-    "\tsetp.gt.f32 \t%p15, %f49, 0f3F800000;\n"
+-    "\tselp.f32 \t%f56, 0f3F800000, %f49, %p15;\n"
+-    "\tfma.rn.f32 \t%f57, %f56, 0f437F0000, 0f3F000000;\n"
+-    "\tselp.f32 \t%f58, 0f3F000000, %f57, %p14;\n"
+-    "\tcvt.rzi.u32.f32 \t%r28, %f58;\n"
+-    "\tst.global.u8 \t[%rd18+2], %r28;\n"
+-    "\tmov.u16 \t%rs7, 255;\n"
+-    "\tst.global.u8 \t[%rd18+3], %rs7;\n"
++    "	mov.f32 	%f32, 0f3F800000;\n"
++    "	sub.f32 	%f33, %f32, %f19;\n"
++    "	sub.f32 	%f34, %f33, %f20;\n"
++    "	add.f32 	%f35, %f33, %f33;\n"
++    "	fma.rn.f32 	%f36, %f35, %f64, %f62;\n"
++    "	add.f32 	%f37, %f19, %f19;\n"
++    "	mul.f32 	%f38, %f37, %f33;\n"
++    "	div.rn.f32 	%f39, %f38, %f34;\n"
++    "	mul.f32 	%f40, %f39, %f64;\n"
++    "	sub.f32 	%f41, %f62, %f40;\n"
++    "	sub.f32 	%f42, %f32, %f20;\n"
++    "	add.f32 	%f43, %f20, %f20;\n"
++    "	mul.f32 	%f44, %f43, %f42;\n"
++    "	div.rn.f32 	%f45, %f44, %f34;\n"
++    "	mul.f32 	%f46, %f45, %f63;\n"
++    "	sub.f32 	%f47, %f41, %f46;\n"
++    "	add.f32 	%f48, %f42, %f42;\n"
++    "	fma.rn.f32 	%f49, %f48, %f63, %f62;\n"
++    "	mul.lo.s32 	%r24, %r2, %r7;\n"
++    "	cvt.s64.s32 	%rd14, %r24;\n"
++    "	shl.b32 	%r25, %r1, 2;\n"
++    "	cvt.s64.s32 	%rd15, %r25;\n"
++    "	add.s64 	%rd16, %rd14, %rd15;\n"
++    "	cvta.to.global.u64 	%rd17, %rd3;\n"
++    "	add.s64 	%rd18, %rd17, %rd16;\n"
++    "	setp.lt.f32 	%p10, %f36, 0f00000000;\n"
++    "	setp.gt.f32 	%p11, %f36, 0f3F800000;\n"
++    "	selp.f32 	%f50, 0f3F800000, %f36, %p11;\n"
++    "	fma.rn.f32 	%f51, %f50, 0f437F0000, 0f3F000000;\n"
++    "	selp.f32 	%f52, 0f3F000000, %f51, %p10;\n"
++    "	cvt.rzi.u32.f32 	%r26, %f52;\n"
++    "	st.global.u8 	[%rd18], %r26;\n"
++    "	setp.lt.f32 	%p12, %f47, 0f00000000;\n"
++    "	setp.gt.f32 	%p13, %f47, 0f3F800000;\n"
++    "	selp.f32 	%f53, 0f3F800000, %f47, %p13;\n"
++    "	fma.rn.f32 	%f54, %f53, 0f437F0000, 0f3F000000;\n"
++    "	selp.f32 	%f55, 0f3F000000, %f54, %p12;\n"
++    "	cvt.rzi.u32.f32 	%r27, %f55;\n"
++    "	st.global.u8 	[%rd18+1], %r27;\n"
++    "	setp.lt.f32 	%p14, %f49, 0f00000000;\n"
++    "	setp.gt.f32 	%p15, %f49, 0f3F800000;\n"
++    "	selp.f32 	%f56, 0f3F800000, %f49, %p15;\n"
++    "	fma.rn.f32 	%f57, %f56, 0f437F0000, 0f3F000000;\n"
++    "	selp.f32 	%f58, 0f3F000000, %f57, %p14;\n"
++    "	cvt.rzi.u32.f32 	%r28, %f58;\n"
++    "	st.global.u8 	[%rd18+2], %r28;\n"
++    "	mov.u16 	%rs7, 255;\n"
++    "	st.global.u8 	[%rd18+3], %rs7;\n"
+     "\n"
+     "$L__BB0_8:\n"
+-    "\tret;\n"
++    "	ret;\n"
+     "\n"
+     "}\n"
+-    "\t// .globl\trgba_to_yuv\n"
++    "	// .globl	rgba_to_yuv\n"
+     ".visible .entry rgba_to_yuv(\n"
+-    "\t.param .u64 rgba_to_yuv_param_0,\n"
+-    "\t.param .u32 rgba_to_yuv_param_1,\n"
+-    "\t.param .u64 rgba_to_yuv_param_2,\n"
+-    "\t.param .u32 rgba_to_yuv_param_3,\n"
+-    "\t.param .u64 rgba_to_yuv_param_4,\n"
+-    "\t.param .u32 rgba_to_yuv_param_5,\n"
+-    "\t.param .u32 rgba_to_yuv_param_6,\n"
+-    "\t.param .u32 rgba_to_yuv_param_7,\n"
+-    "\t.param .u32 rgba_to_yuv_param_8,\n"
+-    "\t.param .u32 rgba_to_yuv_param_9,\n"
+-    "\t.param .f32 rgba_to_yuv_param_10,\n"
+-    "\t.param .f32 rgba_to_yuv_param_11\n"
++    "	.param .u64 rgba_to_yuv_param_0,\n"
++    "	.param .u32 rgba_to_yuv_param_1,\n"
++    "	.param .u64 rgba_to_yuv_param_2,\n"
++    "	.param .u32 rgba_to_yuv_param_3,\n"
++    "	.param .u64 rgba_to_yuv_param_4,\n"
++    "	.param .u32 rgba_to_yuv_param_5,\n"
++    "	.param .u32 rgba_to_yuv_param_6,\n"
++    "	.param .u32 rgba_to_yuv_param_7,\n"
++    "	.param .u32 rgba_to_yuv_param_8,\n"
++    "	.param .u32 rgba_to_yuv_param_9,\n"
++    "	.param .f32 rgba_to_yuv_param_10,\n"
++    "	.param .f32 rgba_to_yuv_param_11\n"
+     ")\n"
+     "{\n"
+-    "\t.reg .pred \t%p<36>;\n"
+-    "\t.reg .b16 \t%rs<16>;\n"
+-    "\t.reg .f32 \t%f<131>;\n"
+-    "\t.reg .b32 \t%r<48>;\n"
+-    "\t.reg .b64 \t%rd<28>;\n"
+-    "\n"
+-    "\n"
+-    "\tld.param.u64 \t%rd8, [rgba_to_yuv_param_0];\n"
+-    "\tld.param.u32 \t%r12, [rgba_to_yuv_param_1];\n"
+-    "\tld.param.u64 \t%rd9, [rgba_to_yuv_param_2];\n"
+-    "\tld.param.u32 \t%r13, [rgba_to_yuv_param_3];\n"
+-    "\tld.param.u64 \t%rd10, [rgba_to_yuv_param_4];\n"
+-    "\tld.param.u32 \t%r14, [rgba_to_yuv_param_5];\n"
+-    "\tld.param.u32 \t%r15, [rgba_to_yuv_param_6];\n"
+-    "\tld.param.u32 \t%r16, [rgba_to_yuv_param_7];\n"
+-    "\tld.param.u32 \t%r17, [rgba_to_yuv_param_8];\n"
+-    "\tld.param.u32 \t%r18, [rgba_to_yuv_param_9];\n"
+-    "\tld.param.f32 \t%f31, [rgba_to_yuv_param_10];\n"
+-    "\tld.param.f32 \t%f32, [rgba_to_yuv_param_11];\n"
+-    "\tcvta.to.global.u64 \t%rd1, %rd10;\n"
+-    "\tcvta.to.global.u64 \t%rd2, %rd9;\n"
+-    "\tcvta.to.global.u64 \t%rd3, %rd8;\n"
+-    "\tmov.u32 \t%r19, %ntid.x;\n"
+-    "\tmov.u32 \t%r20, %ctaid.x;\n"
+-    "\tmov.u32 \t%r21, %tid.x;\n"
+-    "\tmad.lo.s32 \t%r1, %r20, %r19, %r21;\n"
+-    "\tmov.u32 \t%r22, %ntid.y;\n"
+-    "\tmov.u32 \t%r23, %ctaid.y;\n"
+-    "\tmov.u32 \t%r24, %tid.y;\n"
+-    "\tmad.lo.s32 \t%r2, %r23, %r22, %r24;\n"
+-    "\tsetp.ge.s32 \t%p1, %r1, %r15;\n"
+-    "\tsetp.ge.s32 \t%p2, %r2, %r16;\n"
+-    "\tor.pred  \t%p3, %p1, %p2;\n"
+-    "\t@%p3 bra \t$L__BB1_20;\n"
+-    "\n"
+-    "\tmov.f32 \t%f33, 0f3F800000;\n"
+-    "\tsub.f32 \t%f1, %f33, %f31;\n"
+-    "\tsub.f32 \t%f2, %f1, %f32;\n"
+-    "\tmul.lo.s32 \t%r25, %r2, %r12;\n"
+-    "\tcvt.s64.s32 \t%rd4, %r25;\n"
+-    "\tshl.b32 \t%r26, %r1, 2;\n"
+-    "\tcvt.s64.s32 \t%rd5, %r26;\n"
+-    "\tadd.s64 \t%rd11, %rd4, %rd5;\n"
+-    "\tadd.s64 \t%rd6, %rd3, %rd11;\n"
+-    "\tld.global.u8 \t%rs1, [%rd6];\n"
+-    "\tcvt.rn.f32.u16 \t%f34, %rs1;\n"
+-    "\tmul.f32 \t%f35, %f34, 0f3B808081;\n"
+-    "\tld.global.u8 \t%rs2, [%rd6+1];\n"
+-    "\tcvt.rn.f32.u16 \t%f36, %rs2;\n"
+-    "\tmul.f32 \t%f37, %f36, 0f3B808081;\n"
+-    "\tld.global.u8 \t%rs3, [%rd6+2];\n"
+-    "\tcvt.rn.f32.u16 \t%f38, %rs3;\n"
+-    "\tmul.f32 \t%f39, %f38, 0f3B808081;\n"
+-    "\tmul.f32 \t%f40, %f2, %f37;\n"
+-    "\tfma.rn.f32 \t%f41, %f35, %f31, %f40;\n"
+-    "\tfma.rn.f32 \t%f3, %f39, %f32, %f41;\n"
+-    "\tsetp.eq.s32 \t%p4, %r18, 0;\n"
+-    "\t@%p4 bra \t$L__BB1_3;\n"
+-    "\n"
+-    "\tsetp.eq.s32 \t%p5, %r17, 0;\n"
+-    "\tselp.f32 \t%f42, 0f41800000, 0f45800000, %p5;\n"
+-    "\tselp.f32 \t%f43, 0f435B0000, 0f475B0000, %p5;\n"
+-    "\tsetp.gt.f32 \t%p6, %f3, 0f3F800000;\n"
+-    "\tselp.f32 \t%f44, 0f3F800000, %f3, %p6;\n"
+-    "\tsetp.lt.f32 \t%p7, %f3, 0f00000000;\n"
+-    "\tselp.f32 \t%f45, 0f00000000, %f44, %p7;\n"
+-    "\tfma.rn.f32 \t%f122, %f43, %f45, %f42;\n"
+-    "\tbra.uni \t$L__BB1_4;\n"
++    "	.reg .pred 	%p<36>;\n"
++    "	.reg .b16 	%rs<16>;\n"
++    "	.reg .f32 	%f<131>;\n"
++    "	.reg .b32 	%r<48>;\n"
++    "	.reg .b64 	%rd<28>;\n"
++    "\n"
++    "\n"
++    "	ld.param.u64 	%rd8, [rgba_to_yuv_param_0];\n"
++    "	ld.param.u32 	%r12, [rgba_to_yuv_param_1];\n"
++    "	ld.param.u64 	%rd9, [rgba_to_yuv_param_2];\n"
++    "	ld.param.u32 	%r13, [rgba_to_yuv_param_3];\n"
++    "	ld.param.u64 	%rd10, [rgba_to_yuv_param_4];\n"
++    "	ld.param.u32 	%r14, [rgba_to_yuv_param_5];\n"
++    "	ld.param.u32 	%r15, [rgba_to_yuv_param_6];\n"
++    "	ld.param.u32 	%r16, [rgba_to_yuv_param_7];\n"
++    "	ld.param.u32 	%r17, [rgba_to_yuv_param_8];\n"
++    "	ld.param.u32 	%r18, [rgba_to_yuv_param_9];\n"
++    "	ld.param.f32 	%f31, [rgba_to_yuv_param_10];\n"
++    "	ld.param.f32 	%f32, [rgba_to_yuv_param_11];\n"
++    "	cvta.to.global.u64 	%rd1, %rd10;\n"
++    "	cvta.to.global.u64 	%rd2, %rd9;\n"
++    "	cvta.to.global.u64 	%rd3, %rd8;\n"
++    "	mov.u32 	%r19, %ntid.x;\n"
++    "	mov.u32 	%r20, %ctaid.x;\n"
++    "	mov.u32 	%r21, %tid.x;\n"
++    "	mad.lo.s32 	%r1, %r20, %r19, %r21;\n"
++    "	mov.u32 	%r22, %ntid.y;\n"
++    "	mov.u32 	%r23, %ctaid.y;\n"
++    "	mov.u32 	%r24, %tid.y;\n"
++    "	mad.lo.s32 	%r2, %r23, %r22, %r24;\n"
++    "	setp.ge.s32 	%p1, %r1, %r15;\n"
++    "	setp.ge.s32 	%p2, %r2, %r16;\n"
++    "	or.pred  	%p3, %p1, %p2;\n"
++    "	@%p3 bra 	$L__BB1_20;\n"
++    "\n"
++    "	mov.f32 	%f33, 0f3F800000;\n"
++    "	sub.f32 	%f1, %f33, %f31;\n"
++    "	sub.f32 	%f2, %f1, %f32;\n"
++    "	mul.lo.s32 	%r25, %r2, %r12;\n"
++    "	cvt.s64.s32 	%rd4, %r25;\n"
++    "	shl.b32 	%r26, %r1, 2;\n"
++    "	cvt.s64.s32 	%rd5, %r26;\n"
++    "	add.s64 	%rd11, %rd4, %rd5;\n"
++    "	add.s64 	%rd6, %rd3, %rd11;\n"
++    "	ld.global.u8 	%rs1, [%rd6];\n"
++    "	cvt.rn.f32.u16 	%f34, %rs1;\n"
++    "	mul.f32 	%f35, %f34, 0f3B808081;\n"
++    "	ld.global.u8 	%rs2, [%rd6+1];\n"
++    "	cvt.rn.f32.u16 	%f36, %rs2;\n"
++    "	mul.f32 	%f37, %f36, 0f3B808081;\n"
++    "	ld.global.u8 	%rs3, [%rd6+2];\n"
++    "	cvt.rn.f32.u16 	%f38, %rs3;\n"
++    "	mul.f32 	%f39, %f38, 0f3B808081;\n"
++    "	mul.f32 	%f40, %f2, %f37;\n"
++    "	fma.rn.f32 	%f41, %f35, %f31, %f40;\n"
++    "	fma.rn.f32 	%f3, %f39, %f32, %f41;\n"
++    "	setp.eq.s32 	%p4, %r18, 0;\n"
++    "	@%p4 bra 	$L__BB1_3;\n"
++    "\n"
++    "	setp.eq.s32 	%p5, %r17, 0;\n"
++    "	selp.f32 	%f42, 0f41800000, 0f45800000, %p5;\n"
++    "	selp.f32 	%f43, 0f435B0000, 0f475B0000, %p5;\n"
++    "	setp.gt.f32 	%p6, %f3, 0f3F800000;\n"
++    "	selp.f32 	%f44, 0f3F800000, %f3, %p6;\n"
++    "	setp.lt.f32 	%p7, %f3, 0f00000000;\n"
++    "	selp.f32 	%f45, 0f00000000, %f44, %p7;\n"
++    "	fma.rn.f32 	%f122, %f43, %f45, %f42;\n"
++    "	bra.uni 	$L__BB1_4;\n"
+     "\n"
+     "$L__BB1_3:\n"
+-    "\tsetp.lt.f32 \t%p8, %f3, 0f00000000;\n"
+-    "\tsetp.gt.f32 \t%p9, %f3, 0f3F800000;\n"
+-    "\tselp.f32 \t%f46, 0f3F800000, %f3, %p9;\n"
+-    "\tselp.f32 \t%f47, 0f00000000, %f46, %p8;\n"
+-    "\tsetp.eq.s32 \t%p10, %r17, 0;\n"
+-    "\tselp.f32 \t%f48, 0f437F0000, 0f477FFF00, %p10;\n"
+-    "\tmul.f32 \t%f122, %f48, %f47;\n"
++    "	setp.lt.f32 	%p8, %f3, 0f00000000;\n"
++    "	setp.gt.f32 	%p9, %f3, 0f3F800000;\n"
++    "	selp.f32 	%f46, 0f3F800000, %f3, %p9;\n"
++    "	selp.f32 	%f47, 0f00000000, %f46, %p8;\n"
++    "	setp.eq.s32 	%p10, %r17, 0;\n"
++    "	selp.f32 	%f48, 0f437F0000, 0f477FFF00, %p10;\n"
++    "	mul.f32 	%f122, %f48, %f47;\n"
+     "\n"
+     "$L__BB1_4:\n"
+-    "\tadd.f32 \t%f49, %f122, 0f3F000000;\n"
+-    "\tcvt.rzi.u32.f32 \t%r3, %f49;\n"
+-    "\tsetp.eq.s32 \t%p11, %r17, 0;\n"
+-    "\t@%p11 bra \t$L__BB1_6;\n"
+-    "\n"
+-    "\tshr.s32 \t%r27, %r13, 1;\n"
+-    "\tmad.lo.s32 \t%r28, %r27, %r2, %r1;\n"
+-    "\tmul.wide.s32 \t%rd12, %r28, 2;\n"
+-    "\tadd.s64 \t%rd13, %rd2, %rd12;\n"
+-    "\tst.global.u16 \t[%rd13], %r3;\n"
+-    "\tbra.uni \t$L__BB1_7;\n"
++    "	add.f32 	%f49, %f122, 0f3F000000;\n"
++    "	cvt.rzi.u32.f32 	%r3, %f49;\n"
++    "	setp.eq.s32 	%p11, %r17, 0;\n"
++    "	@%p11 bra 	$L__BB1_6;\n"
++    "\n"
++    "	shr.s32 	%r27, %r13, 1;\n"
++    "	mad.lo.s32 	%r28, %r27, %r2, %r1;\n"
++    "	mul.wide.s32 	%rd12, %r28, 2;\n"
++    "	add.s64 	%rd13, %rd2, %rd12;\n"
++    "	st.global.u16 	[%rd13], %r3;\n"
++    "	bra.uni 	$L__BB1_7;\n"
+     "\n"
+     "$L__BB1_6:\n"
+-    "\tmad.lo.s32 \t%r29, %r2, %r13, %r1;\n"
+-    "\tcvt.s64.s32 \t%rd14, %r29;\n"
+-    "\tadd.s64 \t%rd15, %rd2, %rd14;\n"
+-    "\tst.global.u8 \t[%rd15], %r3;\n"
++    "	mad.lo.s32 	%r29, %r2, %r13, %r1;\n"
++    "	cvt.s64.s32 	%rd14, %r29;\n"
++    "	add.s64 	%rd15, %rd2, %rd14;\n"
++    "	st.global.u8 	[%rd15], %r3;\n"
+     "\n"
+     "$L__BB1_7:\n"
+-    "\tand.b32  \t%r30, %r1, 1;\n"
+-    "\tsetp.eq.b32 \t%p12, %r30, 1;\n"
+-    "\tand.b32  \t%r31, %r2, 1;\n"
+-    "\tsetp.eq.b32 \t%p13, %r31, 1;\n"
+-    "\tor.pred  \t%p14, %p13, %p12;\n"
+-    "\tmov.pred \t%p15, 0;\n"
+-    "\txor.pred  \t%p16, %p14, %p15;\n"
+-    "\t@%p16 bra \t$L__BB1_20;\n"
+-    "\n"
+-    "\tmov.f32 \t%f50, 0f3F800000;\n"
+-    "\tsub.f32 \t%f51, %f50, %f32;\n"
+-    "\tadd.f32 \t%f7, %f51, %f51;\n"
+-    "\tld.global.u8 \t%rs4, [%rd6];\n"
+-    "\tcvt.rn.f32.u16 \t%f52, %rs4;\n"
+-    "\tmul.f32 \t%f53, %f52, 0f3B808081;\n"
+-    "\tld.global.u8 \t%rs5, [%rd6+1];\n"
+-    "\tcvt.rn.f32.u16 \t%f54, %rs5;\n"
+-    "\tmul.f32 \t%f55, %f54, 0f3B808081;\n"
+-    "\tld.global.u8 \t%rs6, [%rd6+2];\n"
+-    "\tcvt.rn.f32.u16 \t%f56, %rs6;\n"
+-    "\tmul.f32 \t%f57, %f56, 0f3B808081;\n"
+-    "\tmul.f32 \t%f58, %f2, %f55;\n"
+-    "\tfma.rn.f32 \t%f59, %f53, %f31, %f58;\n"
+-    "\tfma.rn.f32 \t%f60, %f57, %f32, %f59;\n"
+-    "\tsub.f32 \t%f61, %f57, %f60;\n"
+-    "\tdiv.rn.f32 \t%f62, %f61, %f7;\n"
+-    "\tadd.f32 \t%f125, %f62, 0f00000000;\n"
+-    "\tsub.f32 \t%f63, %f53, %f60;\n"
+-    "\tadd.f32 \t%f9, %f1, %f1;\n"
+-    "\tdiv.rn.f32 \t%f64, %f63, %f9;\n"
+-    "\tadd.f32 \t%f126, %f64, 0f00000000;\n"
+-    "\tadd.s32 \t%r4, %r1, 1;\n"
+-    "\tmov.u32 \t%r46, 1;\n"
+-    "\tsetp.ge.s32 \t%p17, %r4, %r15;\n"
+-    "\t@%p17 bra \t$L__BB1_10;\n"
+-    "\n"
+-    "\tshl.b32 \t%r34, %r4, 2;\n"
+-    "\tmov.u32 \t%r46, 2;\n"
+-    "\tcvt.s64.s32 \t%rd16, %r34;\n"
+-    "\tadd.s64 \t%rd17, %rd16, %rd4;\n"
+-    "\tadd.s64 \t%rd18, %rd3, %rd17;\n"
+-    "\tld.global.u8 \t%rs7, [%rd18];\n"
+-    "\tcvt.rn.f32.u16 \t%f65, %rs7;\n"
+-    "\tmul.f32 \t%f66, %f65, 0f3B808081;\n"
+-    "\tld.global.u8 \t%rs8, [%rd18+1];\n"
+-    "\tcvt.rn.f32.u16 \t%f67, %rs8;\n"
+-    "\tmul.f32 \t%f68, %f67, 0f3B808081;\n"
+-    "\tld.global.u8 \t%rs9, [%rd18+2];\n"
+-    "\tcvt.rn.f32.u16 \t%f69, %rs9;\n"
+-    "\tmul.f32 \t%f70, %f69, 0f3B808081;\n"
+-    "\tmul.f32 \t%f71, %f2, %f68;\n"
+-    "\tfma.rn.f32 \t%f72, %f66, %f31, %f71;\n"
+-    "\tfma.rn.f32 \t%f73, %f70, %f32, %f72;\n"
+-    "\tsub.f32 \t%f74, %f70, %f73;\n"
+-    "\tdiv.rn.f32 \t%f75, %f74, %f7;\n"
+-    "\tadd.f32 \t%f125, %f125, %f75;\n"
+-    "\tsub.f32 \t%f76, %f66, %f73;\n"
+-    "\tdiv.rn.f32 \t%f77, %f76, %f9;\n"
+-    "\tadd.f32 \t%f126, %f126, %f77;\n"
++    "	and.b32  	%r30, %r1, 1;\n"
++    "	setp.eq.b32 	%p12, %r30, 1;\n"
++    "	and.b32  	%r31, %r2, 1;\n"
++    "	setp.eq.b32 	%p13, %r31, 1;\n"
++    "	or.pred  	%p14, %p13, %p12;\n"
++    "	mov.pred 	%p15, 0;\n"
++    "	xor.pred  	%p16, %p14, %p15;\n"
++    "	@%p16 bra 	$L__BB1_20;\n"
++    "\n"
++    "	mov.f32 	%f50, 0f3F800000;\n"
++    "	sub.f32 	%f51, %f50, %f32;\n"
++    "	add.f32 	%f7, %f51, %f51;\n"
++    "	ld.global.u8 	%rs4, [%rd6];\n"
++    "	cvt.rn.f32.u16 	%f52, %rs4;\n"
++    "	mul.f32 	%f53, %f52, 0f3B808081;\n"
++    "	ld.global.u8 	%rs5, [%rd6+1];\n"
++    "	cvt.rn.f32.u16 	%f54, %rs5;\n"
++    "	mul.f32 	%f55, %f54, 0f3B808081;\n"
++    "	ld.global.u8 	%rs6, [%rd6+2];\n"
++    "	cvt.rn.f32.u16 	%f56, %rs6;\n"
++    "	mul.f32 	%f57, %f56, 0f3B808081;\n"
++    "	mul.f32 	%f58, %f2, %f55;\n"
++    "	fma.rn.f32 	%f59, %f53, %f31, %f58;\n"
++    "	fma.rn.f32 	%f60, %f57, %f32, %f59;\n"
++    "	sub.f32 	%f61, %f57, %f60;\n"
++    "	div.rn.f32 	%f62, %f61, %f7;\n"
++    "	add.f32 	%f125, %f62, 0f00000000;\n"
++    "	sub.f32 	%f63, %f53, %f60;\n"
++    "	add.f32 	%f9, %f1, %f1;\n"
++    "	div.rn.f32 	%f64, %f63, %f9;\n"
++    "	add.f32 	%f126, %f64, 0f00000000;\n"
++    "	add.s32 	%r4, %r1, 1;\n"
++    "	mov.u32 	%r46, 1;\n"
++    "	setp.ge.s32 	%p17, %r4, %r15;\n"
++    "	@%p17 bra 	$L__BB1_10;\n"
++    "\n"
++    "	shl.b32 	%r34, %r4, 2;\n"
++    "	mov.u32 	%r46, 2;\n"
++    "	cvt.s64.s32 	%rd16, %r34;\n"
++    "	add.s64 	%rd17, %rd16, %rd4;\n"
++    "	add.s64 	%rd18, %rd3, %rd17;\n"
++    "	ld.global.u8 	%rs7, [%rd18];\n"
++    "	cvt.rn.f32.u16 	%f65, %rs7;\n"
++    "	mul.f32 	%f66, %f65, 0f3B808081;\n"
++    "	ld.global.u8 	%rs8, [%rd18+1];\n"
++    "	cvt.rn.f32.u16 	%f67, %rs8;\n"
++    "	mul.f32 	%f68, %f67, 0f3B808081;\n"
++    "	ld.global.u8 	%rs9, [%rd18+2];\n"
++    "	cvt.rn.f32.u16 	%f69, %rs9;\n"
++    "	mul.f32 	%f70, %f69, 0f3B808081;\n"
++    "	mul.f32 	%f71, %f2, %f68;\n"
++    "	fma.rn.f32 	%f72, %f66, %f31, %f71;\n"
++    "	fma.rn.f32 	%f73, %f70, %f32, %f72;\n"
++    "	sub.f32 	%f74, %f70, %f73;\n"
++    "	div.rn.f32 	%f75, %f74, %f7;\n"
++    "	add.f32 	%f125, %f125, %f75;\n"
++    "	sub.f32 	%f76, %f66, %f73;\n"
++    "	div.rn.f32 	%f77, %f76, %f9;\n"
++    "	add.f32 	%f126, %f126, %f77;\n"
+     "\n"
+     "$L__BB1_10:\n"
+-    "\tadd.s32 \t%r6, %r2, 1;\n"
+-    "\tsetp.ge.s32 \t%p18, %r6, %r16;\n"
+-    "\tcvt.u32.u64 \t%r35, %rd4;\n"
+-    "\tadd.s32 \t%r36, %r35, %r12;\n"
+-    "\tcvt.s64.s32 \t%rd7, %r36;\n"
+-    "\t@%p18 bra \t$L__BB1_12;\n"
+-    "\n"
+-    "\tadd.s64 \t%rd19, %rd5, %rd7;\n"
+-    "\tadd.s64 \t%rd20, %rd3, %rd19;\n"
+-    "\tld.global.u8 \t%rs10, [%rd20];\n"
+-    "\tcvt.rn.f32.u16 \t%f78, %rs10;\n"
+-    "\tmul.f32 \t%f79, %f78, 0f3B808081;\n"
+-    "\tld.global.u8 \t%rs11, [%rd20+1];\n"
+-    "\tcvt.rn.f32.u16 \t%f80, %rs11;\n"
+-    "\tmul.f32 \t%f81, %f80, 0f3B808081;\n"
+-    "\tld.global.u8 \t%rs12, [%rd20+2];\n"
+-    "\tcvt.rn.f32.u16 \t%f82, %rs12;\n"
+-    "\tmul.f32 \t%f83, %f82, 0f3B808081;\n"
+-    "\tmul.f32 \t%f84, %f2, %f81;\n"
+-    "\tfma.rn.f32 \t%f85, %f79, %f31, %f84;\n"
+-    "\tfma.rn.f32 \t%f86, %f83, %f32, %f85;\n"
+-    "\tsub.f32 \t%f87, %f83, %f86;\n"
+-    "\tdiv.rn.f32 \t%f88, %f87, %f7;\n"
+-    "\tadd.f32 \t%f125, %f125, %f88;\n"
+-    "\tsub.f32 \t%f89, %f79, %f86;\n"
+-    "\tdiv.rn.f32 \t%f90, %f89, %f9;\n"
+-    "\tadd.f32 \t%f126, %f126, %f90;\n"
+-    "\tadd.s32 \t%r46, %r46, 1;\n"
++    "	add.s32 	%r6, %r2, 1;\n"
++    "	setp.ge.s32 	%p18, %r6, %r16;\n"
++    "	cvt.u32.u64 	%r35, %rd4;\n"
++    "	add.s32 	%r36, %r35, %r12;\n"
++    "	cvt.s64.s32 	%rd7, %r36;\n"
++    "	@%p18 bra 	$L__BB1_12;\n"
++    "\n"
++    "	add.s64 	%rd19, %rd5, %rd7;\n"
++    "	add.s64 	%rd20, %rd3, %rd19;\n"
++    "	ld.global.u8 	%rs10, [%rd20];\n"
++    "	cvt.rn.f32.u16 	%f78, %rs10;\n"
++    "	mul.f32 	%f79, %f78, 0f3B808081;\n"
++    "	ld.global.u8 	%rs11, [%rd20+1];\n"
++    "	cvt.rn.f32.u16 	%f80, %rs11;\n"
++    "	mul.f32 	%f81, %f80, 0f3B808081;\n"
++    "	ld.global.u8 	%rs12, [%rd20+2];\n"
++    "	cvt.rn.f32.u16 	%f82, %rs12;\n"
++    "	mul.f32 	%f83, %f82, 0f3B808081;\n"
++    "	mul.f32 	%f84, %f2, %f81;\n"
++    "	fma.rn.f32 	%f85, %f79, %f31, %f84;\n"
++    "	fma.rn.f32 	%f86, %f83, %f32, %f85;\n"
++    "	sub.f32 	%f87, %f83, %f86;\n"
++    "	div.rn.f32 	%f88, %f87, %f7;\n"
++    "	add.f32 	%f125, %f125, %f88;\n"
++    "	sub.f32 	%f89, %f79, %f86;\n"
++    "	div.rn.f32 	%f90, %f89, %f9;\n"
++    "	add.f32 	%f126, %f126, %f90;\n"
++    "	add.s32 	%r46, %r46, 1;\n"
+     "\n"
+     "$L__BB1_12:\n"
+-    "\tor.pred  \t%p21, %p18, %p17;\n"
+-    "\t@%p21 bra \t$L__BB1_14;\n"
+-    "\n"
+-    "\tshl.b32 \t%r37, %r4, 2;\n"
+-    "\tcvt.s64.s32 \t%rd21, %r37;\n"
+-    "\tadd.s64 \t%rd22, %rd21, %rd7;\n"
+-    "\tadd.s64 \t%rd23, %rd3, %rd22;\n"
+-    "\tld.global.u8 \t%rs13, [%rd23];\n"
+-    "\tcvt.rn.f32.u16 \t%f91, %rs13;\n"
+-    "\tmul.f32 \t%f92, %f91, 0f3B808081;\n"
+-    "\tld.global.u8 \t%rs14, [%rd23+1];\n"
+-    "\tcvt.rn.f32.u16 \t%f93, %rs14;\n"
+-    "\tmul.f32 \t%f94, %f93, 0f3B808081;\n"
+-    "\tld.global.u8 \t%rs15, [%rd23+2];\n"
+-    "\tcvt.rn.f32.u16 \t%f95, %rs15;\n"
+-    "\tmul.f32 \t%f96, %f95, 0f3B808081;\n"
+-    "\tmul.f32 \t%f97, %f2, %f94;\n"
+-    "\tfma.rn.f32 \t%f98, %f92, %f31, %f97;\n"
+-    "\tfma.rn.f32 \t%f99, %f96, %f32, %f98;\n"
+-    "\tsub.f32 \t%f100, %f96, %f99;\n"
+-    "\tdiv.rn.f32 \t%f101, %f100, %f7;\n"
+-    "\tadd.f32 \t%f125, %f125, %f101;\n"
+-    "\tsub.f32 \t%f102, %f92, %f99;\n"
+-    "\tdiv.rn.f32 \t%f103, %f102, %f9;\n"
+-    "\tadd.f32 \t%f126, %f126, %f103;\n"
+-    "\tadd.s32 \t%r46, %r46, 1;\n"
++    "	or.pred  	%p21, %p18, %p17;\n"
++    "	@%p21 bra 	$L__BB1_14;\n"
++    "\n"
++    "	shl.b32 	%r37, %r4, 2;\n"
++    "	cvt.s64.s32 	%rd21, %r37;\n"
++    "	add.s64 	%rd22, %rd21, %rd7;\n"
++    "	add.s64 	%rd23, %rd3, %rd22;\n"
++    "	ld.global.u8 	%rs13, [%rd23];\n"
++    "	cvt.rn.f32.u16 	%f91, %rs13;\n"
++    "	mul.f32 	%f92, %f91, 0f3B808081;\n"
++    "	ld.global.u8 	%rs14, [%rd23+1];\n"
++    "	cvt.rn.f32.u16 	%f93, %rs14;\n"
++    "	mul.f32 	%f94, %f93, 0f3B808081;\n"
++    "	ld.global.u8 	%rs15, [%rd23+2];\n"
++    "	cvt.rn.f32.u16 	%f95, %rs15;\n"
++    "	mul.f32 	%f96, %f95, 0f3B808081;\n"
++    "	mul.f32 	%f97, %f2, %f94;\n"
++    "	fma.rn.f32 	%f98, %f92, %f31, %f97;\n"
++    "	fma.rn.f32 	%f99, %f96, %f32, %f98;\n"
++    "	sub.f32 	%f100, %f96, %f99;\n"
++    "	div.rn.f32 	%f101, %f100, %f7;\n"
++    "	add.f32 	%f125, %f125, %f101;\n"
++    "	sub.f32 	%f102, %f92, %f99;\n"
++    "	div.rn.f32 	%f103, %f102, %f9;\n"
++    "	add.f32 	%f126, %f126, %f103;\n"
++    "	add.s32 	%r46, %r46, 1;\n"
+     "\n"
+     "$L__BB1_14:\n"
+-    "\tcvt.rn.f32.s32 \t%f104, %r46;\n"
+-    "\tdiv.rn.f32 \t%f23, %f125, %f104;\n"
+-    "\tdiv.rn.f32 \t%f24, %f126, %f104;\n"
+-    "\t@%p4 bra \t$L__BB1_16;\n"
+-    "\n"
+-    "\tsetp.ne.s32 \t%p23, %r17, 0;\n"
+-    "\tselp.f32 \t%f105, 0f47000000, 0f43000000, %p23;\n"
+-    "\tselp.f32 \t%f106, 0f43600000, 0f47600000, %p11;\n"
+-    "\tselp.f32 \t%f107, 0f437F0000, 0f477FFF00, %p11;\n"
+-    "\tfma.rn.f32 \t%f108, %f106, %f23, %f105;\n"
+-    "\tfma.rn.f32 \t%f109, %f106, %f24, %f105;\n"
+-    "\tsetp.lt.f32 \t%p25, %f108, 0f00000000;\n"
+-    "\tsetp.gt.f32 \t%p26, %f108, %f107;\n"
+-    "\tselp.f32 \t%f110, %f107, %f108, %p26;\n"
+-    "\tselp.f32 \t%f129, 0f00000000, %f110, %p25;\n"
+-    "\tsetp.lt.f32 \t%p27, %f109, 0f00000000;\n"
+-    "\tsetp.gt.f32 \t%p28, %f109, %f107;\n"
+-    "\tselp.f32 \t%f111, %f107, %f109, %p28;\n"
+-    "\tselp.f32 \t%f130, 0f00000000, %f111, %p27;\n"
+-    "\tbra.uni \t$L__BB1_17;\n"
++    "	cvt.rn.f32.s32 	%f104, %r46;\n"
++    "	div.rn.f32 	%f23, %f125, %f104;\n"
++    "	div.rn.f32 	%f24, %f126, %f104;\n"
++    "	@%p4 bra 	$L__BB1_16;\n"
++    "\n"
++    "	setp.ne.s32 	%p23, %r17, 0;\n"
++    "	selp.f32 	%f105, 0f47000000, 0f43000000, %p23;\n"
++    "	selp.f32 	%f106, 0f43600000, 0f47600000, %p11;\n"
++    "	selp.f32 	%f107, 0f437F0000, 0f477FFF00, %p11;\n"
++    "	fma.rn.f32 	%f108, %f106, %f23, %f105;\n"
++    "	fma.rn.f32 	%f109, %f106, %f24, %f105;\n"
++    "	setp.lt.f32 	%p25, %f108, 0f00000000;\n"
++    "	setp.gt.f32 	%p26, %f108, %f107;\n"
++    "	selp.f32 	%f110, %f107, %f108, %p26;\n"
++    "	selp.f32 	%f129, 0f00000000, %f110, %p25;\n"
++    "	setp.lt.f32 	%p27, %f109, 0f00000000;\n"
++    "	setp.gt.f32 	%p28, %f109, %f107;\n"
++    "	selp.f32 	%f111, %f107, %f109, %p28;\n"
++    "	selp.f32 	%f130, 0f00000000, %f111, %p27;\n"
++    "	bra.uni 	$L__BB1_17;\n"
+     "\n"
+     "$L__BB1_16:\n"
+-    "\tsetp.ne.s32 \t%p29, %r17, 0;\n"
+-    "\tselp.f32 \t%f112, 0f477FFF00, 0f437F0000, %p29;\n"
+-    "\tselp.f32 \t%f113, 0f43000000, 0f47000000, %p11;\n"
+-    "\tfma.rn.f32 \t%f114, %f112, %f23, %f113;\n"
+-    "\tfma.rn.f32 \t%f115, %f112, %f24, %f113;\n"
+-    "\tsetp.lt.f32 \t%p31, %f114, 0f00000000;\n"
+-    "\tsetp.gt.f32 \t%p32, %f114, %f112;\n"
+-    "\tselp.f32 \t%f116, %f112, %f114, %p32;\n"
+-    "\tselp.f32 \t%f129, 0f00000000, %f116, %p31;\n"
+-    "\tsetp.lt.f32 \t%p33, %f115, 0f00000000;\n"
+-    "\tsetp.gt.f32 \t%p34, %f115, %f112;\n"
+-    "\tselp.f32 \t%f117, %f112, %f115, %p34;\n"
+-    "\tselp.f32 \t%f130, 0f00000000, %f117, %p33;\n"
++    "	setp.ne.s32 	%p29, %r17, 0;\n"
++    "	selp.f32 	%f112, 0f477FFF00, 0f437F0000, %p29;\n"
++    "	selp.f32 	%f113, 0f43000000, 0f47000000, %p11;\n"
++    "	fma.rn.f32 	%f114, %f112, %f23, %f113;\n"
++    "	fma.rn.f32 	%f115, %f112, %f24, %f113;\n"
++    "	setp.lt.f32 	%p31, %f114, 0f00000000;\n"
++    "	setp.gt.f32 	%p32, %f114, %f112;\n"
++    "	selp.f32 	%f116, %f112, %f114, %p32;\n"
++    "	selp.f32 	%f129, 0f00000000, %f116, %p31;\n"
++    "	setp.lt.f32 	%p33, %f115, 0f00000000;\n"
++    "	setp.gt.f32 	%p34, %f115, %f112;\n"
++    "	selp.f32 	%f117, %f112, %f115, %p34;\n"
++    "	selp.f32 	%f130, 0f00000000, %f117, %p33;\n"
+     "\n"
+     "$L__BB1_17:\n"
+-    "\tshr.s32 \t%r11, %r2, 1;\n"
+-    "\t@%p11 bra \t$L__BB1_19;\n"
+-    "\n"
+-    "\tshr.s32 \t%r38, %r14, 1;\n"
+-    "\tmad.lo.s32 \t%r39, %r38, %r11, %r1;\n"
+-    "\tadd.f32 \t%f118, %f129, 0f3F000000;\n"
+-    "\tcvt.rzi.u32.f32 \t%r40, %f118;\n"
+-    "\tmul.wide.s32 \t%rd24, %r39, 2;\n"
+-    "\tadd.s64 \t%rd25, %rd1, %rd24;\n"
+-    "\tst.global.u16 \t[%rd25], %r40;\n"
+-    "\tadd.f32 \t%f119, %f130, 0f3F000000;\n"
+-    "\tcvt.rzi.u32.f32 \t%r41, %f119;\n"
+-    "\tst.global.u16 \t[%rd25+2], %r41;\n"
+-    "\tbra.uni \t$L__BB1_20;\n"
++    "	shr.s32 	%r11, %r2, 1;\n"
++    "	@%p11 bra 	$L__BB1_19;\n"
++    "\n"
++    "	shr.s32 	%r38, %r14, 1;\n"
++    "	mad.lo.s32 	%r39, %r38, %r11, %r1;\n"
++    "	add.f32 	%f118, %f129, 0f3F000000;\n"
++    "	cvt.rzi.u32.f32 	%r40, %f118;\n"
++    "	mul.wide.s32 	%rd24, %r39, 2;\n"
++    "	add.s64 	%rd25, %rd1, %rd24;\n"
++    "	st.global.u16 	[%rd25], %r40;\n"
++    "	add.f32 	%f119, %f130, 0f3F000000;\n"
++    "	cvt.rzi.u32.f32 	%r41, %f119;\n"
++    "	st.global.u16 	[%rd25+2], %r41;\n"
++    "	bra.uni 	$L__BB1_20;\n"
+     "\n"
+     "$L__BB1_19:\n"
+-    "\tadd.f32 \t%f120, %f129, 0f3F000000;\n"
+-    "\tcvt.rzi.u32.f32 \t%r42, %f120;\n"
+-    "\tmad.lo.s32 \t%r43, %r11, %r14, %r1;\n"
+-    "\tcvt.s64.s32 \t%rd26, %r43;\n"
+-    "\tadd.s64 \t%rd27, %rd1, %rd26;\n"
+-    "\tst.global.u8 \t[%rd27], %r42;\n"
+-    "\tadd.f32 \t%f121, %f130, 0f3F000000;\n"
+-    "\tcvt.rzi.u32.f32 \t%r44, %f121;\n"
+-    "\tst.global.u8 \t[%rd27+1], %r44;\n"
++    "	add.f32 	%f120, %f129, 0f3F000000;\n"
++    "	cvt.rzi.u32.f32 	%r42, %f120;\n"
++    "	mad.lo.s32 	%r43, %r11, %r14, %r1;\n"
++    "	cvt.s64.s32 	%rd26, %r43;\n"
++    "	add.s64 	%rd27, %rd1, %rd26;\n"
++    "	st.global.u8 	[%rd27], %r42;\n"
++    "	add.f32 	%f121, %f130, 0f3F000000;\n"
++    "	cvt.rzi.u32.f32 	%r44, %f121;\n"
++    "	st.global.u8 	[%rd27+1], %r44;\n"
+     "\n"
+     "$L__BB1_20:\n"
+-    "\tret;\n"
++    "	ret;\n"
+     "\n"
+     "}\n"
++    "	// .globl	yuv_to_rgb10a2\n"
++    ".visible .entry yuv_to_rgb10a2(\n"
++    "	.param .u64 yuv_to_rgb10a2_param_0,\n"
++    "	.param .u32 yuv_to_rgb10a2_param_1,\n"
++    "	.param .u64 yuv_to_rgb10a2_param_2,\n"
++    "	.param .u32 yuv_to_rgb10a2_param_3,\n"
++    "	.param .u64 yuv_to_rgb10a2_param_4,\n"
++    "	.param .u32 yuv_to_rgb10a2_param_5,\n"
++    "	.param .u32 yuv_to_rgb10a2_param_6,\n"
++    "	.param .u32 yuv_to_rgb10a2_param_7,\n"
++    "	.param .u32 yuv_to_rgb10a2_param_8,\n"
++    "	.param .u32 yuv_to_rgb10a2_param_9,\n"
++    "	.param .f32 yuv_to_rgb10a2_param_10,\n"
++    "	.param .f32 yuv_to_rgb10a2_param_11\n"
++    ")\n"
++    "{\n"
++    "	.reg .pred 	%p<16>;\n"
++    "	.reg .b16 	%rs<7>;\n"
++    "	.reg .f32 	%f<65>;\n"
++    "	.reg .b32 	%r<33>;\n"
++    "	.reg .b64 	%rd<19>;\n"
++    "\n"
++    "\n"
++    "	ld.param.u64 	%rd4, [yuv_to_rgb10a2_param_0];\n"
++    "	ld.param.u32 	%r5, [yuv_to_rgb10a2_param_1];\n"
++    "	ld.param.u64 	%rd5, [yuv_to_rgb10a2_param_2];\n"
++    "	ld.param.u32 	%r6, [yuv_to_rgb10a2_param_3];\n"
++    "	ld.param.u64 	%rd3, [yuv_to_rgb10a2_param_4];\n"
++    "	ld.param.u32 	%r7, [yuv_to_rgb10a2_param_5];\n"
++    "	ld.param.u32 	%r10, [yuv_to_rgb10a2_param_6];\n"
++    "	ld.param.u32 	%r11, [yuv_to_rgb10a2_param_7];\n"
++    "	ld.param.u32 	%r8, [yuv_to_rgb10a2_param_8];\n"
++    "	ld.param.u32 	%r9, [yuv_to_rgb10a2_param_9];\n"
++    "	ld.param.f32 	%f19, [yuv_to_rgb10a2_param_10];\n"
++    "	ld.param.f32 	%f20, [yuv_to_rgb10a2_param_11];\n"
++    "	cvta.to.global.u64 	%rd1, %rd5;\n"
++    "	cvta.to.global.u64 	%rd2, %rd4;\n"
++    "	mov.u32 	%r12, %ntid.x;\n"
++    "	mov.u32 	%r13, %ctaid.x;\n"
++    "	mov.u32 	%r14, %tid.x;\n"
++    "	mad.lo.s32 	%r1, %r13, %r12, %r14;\n"
++    "	mov.u32 	%r15, %ntid.y;\n"
++    "	mov.u32 	%r16, %ctaid.y;\n"
++    "	mov.u32 	%r17, %tid.y;\n"
++    "	mad.lo.s32 	%r2, %r16, %r15, %r17;\n"
++    "	setp.ge.s32 	%p1, %r1, %r10;\n"
++    "	setp.ge.s32 	%p2, %r2, %r11;\n"
++    "	or.pred  	%p3, %p1, %p2;\n"
++    "	@%p3 bra 	$L__BB2_8;\n"
++    "\n"
++    "	and.b32  	%r3, %r1, -2;\n"
++    "	shr.s32 	%r4, %r2, 1;\n"
++    "	setp.eq.s32 	%p4, %r8, 0;\n"
++    "	@%p4 bra 	$L__BB2_3;\n"
++    "\n"
++    "	shr.s32 	%r18, %r5, 1;\n"
++    "	mad.lo.s32 	%r19, %r18, %r2, %r1;\n"
++    "	mul.wide.s32 	%rd6, %r19, 2;\n"
++    "	add.s64 	%rd7, %rd2, %rd6;\n"
++    "	ld.global.u16 	%rs1, [%rd7];\n"
++    "	cvt.rn.f32.u16 	%f59, %rs1;\n"
++    "	shr.s32 	%r20, %r6, 1;\n"
++    "	mad.lo.s32 	%r21, %r20, %r4, %r3;\n"
++    "	mul.wide.s32 	%rd8, %r21, 2;\n"
++    "	add.s64 	%rd9, %rd1, %rd8;\n"
++    "	ld.global.u16 	%rs2, [%rd9];\n"
++    "	cvt.rn.f32.u16 	%f60, %rs2;\n"
++    "	ld.global.u16 	%rs3, [%rd9+2];\n"
++    "	cvt.rn.f32.u16 	%f61, %rs3;\n"
++    "	bra.uni 	$L__BB2_4;\n"
++    "\n"
++    "$L__BB2_3:\n"
++    "	mad.lo.s32 	%r22, %r2, %r5, %r1;\n"
++    "	cvt.s64.s32 	%rd10, %r22;\n"
++    "	add.s64 	%rd11, %rd2, %rd10;\n"
++    "	ld.global.u8 	%rs4, [%rd11];\n"
++    "	cvt.rn.f32.u16 	%f59, %rs4;\n"
++    "	mad.lo.s32 	%r23, %r4, %r6, %r3;\n"
++    "	cvt.s64.s32 	%rd12, %r23;\n"
++    "	add.s64 	%rd13, %rd1, %rd12;\n"
++    "	ld.global.u8 	%rs5, [%rd13];\n"
++    "	cvt.rn.f32.u16 	%f60, %rs5;\n"
++    "	ld.global.u8 	%rs6, [%rd13+1];\n"
++    "	cvt.rn.f32.u16 	%f61, %rs6;\n"
++    "\n"
++    "$L__BB2_4:\n"
++    "	setp.eq.s32 	%p5, %r9, 0;\n"
++    "	@%p5 bra 	$L__BB2_6;\n"
++    "\n"
++    "	setp.ne.s32 	%p6, %r8, 0;\n"
++    "	selp.f32 	%f21, 0f45800000, 0f41800000, %p6;\n"
++    "	selp.f32 	%f22, 0f435B0000, 0f475B0000, %p4;\n"
++    "	selp.f32 	%f23, 0f43000000, 0f47000000, %p4;\n"
++    "	selp.f32 	%f24, 0f43600000, 0f47600000, %p4;\n"
++    "	sub.f32 	%f25, %f59, %f21;\n"
++    "	div.rn.f32 	%f62, %f25, %f22;\n"
++    "	sub.f32 	%f26, %f60, %f23;\n"
++    "	div.rn.f32 	%f63, %f26, %f24;\n"
++    "	sub.f32 	%f27, %f61, %f23;\n"
++    "	div.rn.f32 	%f64, %f27, %f24;\n"
++    "	bra.uni 	$L__BB2_7;\n"
++    "\n"
++    "$L__BB2_6:\n"
++    "	setp.ne.s32 	%p8, %r8, 0;\n"
++    "	selp.f32 	%f28, 0f477FFF00, 0f437F0000, %p8;\n"
++    "	selp.f32 	%f29, 0f43000000, 0f47000000, %p4;\n"
++    "	div.rn.f32 	%f62, %f59, %f28;\n"
++    "	sub.f32 	%f30, %f60, %f29;\n"
++    "	div.rn.f32 	%f63, %f30, %f28;\n"
++    "	sub.f32 	%f31, %f61, %f29;\n"
++    "	div.rn.f32 	%f64, %f31, %f28;\n"
++    "\n"
++    "$L__BB2_7:\n"
++    "	mov.f32 	%f32, 0f3F800000;\n"
++    "	sub.f32 	%f33, %f32, %f19;\n"
++    "	sub.f32 	%f34, %f33, %f20;\n"
++    "	add.f32 	%f35, %f33, %f33;\n"
++    "	fma.rn.f32 	%f36, %f35, %f64, %f62;\n"
++    "	add.f32 	%f37, %f19, %f19;\n"
++    "	mul.f32 	%f38, %f37, %f33;\n"
++    "	div.rn.f32 	%f39, %f38, %f34;\n"
++    "	mul.f32 	%f40, %f39, %f64;\n"
++    "	sub.f32 	%f41, %f62, %f40;\n"
++    "	sub.f32 	%f42, %f32, %f20;\n"
++    "	add.f32 	%f43, %f20, %f20;\n"
++    "	mul.f32 	%f44, %f43, %f42;\n"
++    "	div.rn.f32 	%f45, %f44, %f34;\n"
++    "	mul.f32 	%f46, %f45, %f63;\n"
++    "	sub.f32 	%f47, %f41, %f46;\n"
++    "	add.f32 	%f48, %f42, %f42;\n"
++    "	fma.rn.f32 	%f49, %f48, %f63, %f62;\n"
++    "	mul.lo.s32 	%r24, %r2, %r7;\n"
++    "	cvt.s64.s32 	%rd14, %r24;\n"
++    "	cvta.to.global.u64 	%rd15, %rd3;\n"
++    "	add.s64 	%rd16, %rd15, %rd14;\n"
++    "	mul.wide.s32 	%rd17, %r1, 4;\n"
++    "	add.s64 	%rd18, %rd16, %rd17;\n"
++    "	setp.lt.f32 	%p10, %f36, 0f00000000;\n"
++    "	setp.gt.f32 	%p11, %f36, 0f3F800000;\n"
++    "	selp.f32 	%f50, 0f3F800000, %f36, %p11;\n"
++    "	fma.rn.f32 	%f51, %f50, 0f447FC000, 0f3F000000;\n"
++    "	selp.f32 	%f52, 0f3F000000, %f51, %p10;\n"
++    "	cvt.rzi.u32.f32 	%r25, %f52;\n"
++    "	setp.lt.f32 	%p12, %f47, 0f00000000;\n"
++    "	setp.gt.f32 	%p13, %f47, 0f3F800000;\n"
++    "	selp.f32 	%f53, 0f3F800000, %f47, %p13;\n"
++    "	fma.rn.f32 	%f54, %f53, 0f447FC000, 0f3F000000;\n"
++    "	selp.f32 	%f55, 0f3F000000, %f54, %p12;\n"
++    "	cvt.rzi.u32.f32 	%r26, %f55;\n"
++    "	shl.b32 	%r27, %r26, 10;\n"
++    "	setp.lt.f32 	%p14, %f49, 0f00000000;\n"
++    "	setp.gt.f32 	%p15, %f49, 0f3F800000;\n"
++    "	selp.f32 	%f56, 0f3F800000, %f49, %p15;\n"
++    "	fma.rn.f32 	%f57, %f56, 0f447FC000, 0f3F000000;\n"
++    "	selp.f32 	%f58, 0f3F000000, %f57, %p14;\n"
++    "	cvt.rzi.u32.f32 	%r28, %f58;\n"
++    "	shl.b32 	%r29, %r28, 20;\n"
++    "	or.b32  	%r30, %r25, %r27;\n"
++    "	or.b32  	%r31, %r30, %r29;\n"
++    "	or.b32  	%r32, %r31, -1073741824;\n"
++    "	st.global.u32 	[%rd18], %r32;\n"
++    "\n"
++    "$L__BB2_8:\n"
++    "	ret;\n"
+     "\n"
+-    "\n"
+-;
++    "}\n"
++    "	// .globl	rgb10a2_to_yuv\n"
++    ".visible .entry rgb10a2_to_yuv(\n"
++    "	.param .u64 rgb10a2_to_yuv_param_0,\n"
++    "	.param .u32 rgb10a2_to_yuv_param_1,\n"
++    "	.param .u64 rgb10a2_to_yuv_param_2,\n"
++    "	.param .u32 rgb10a2_to_yuv_param_3,\n"
++    "	.param .u64 rgb10a2_to_yuv_param_4,\n"
++    "	.param .u32 rgb10a2_to_yuv_param_5,\n"
++    "	.param .u32 rgb10a2_to_yuv_param_6,\n"
++    "	.param .u32 rgb10a2_to_yuv_param_7,\n"
++    "	.param .u32 rgb10a2_to_yuv_param_8,\n"
++    "	.param .u32 rgb10a2_to_yuv_param_9,\n"
++    "	.param .f32 rgb10a2_to_yuv_param_10,\n"
++    "	.param .f32 rgb10a2_to_yuv_param_11\n"
++    ")\n"
++    "{\n"
++    "	.reg .pred 	%p<36>;\n"
++    "	.reg .f32 	%f<131>;\n"
++    "	.reg .b32 	%r<74>;\n"
++    "	.reg .b64 	%rd<24>;\n"
++    "\n"
++    "\n"
++    "	ld.param.u64 	%rd7, [rgb10a2_to_yuv_param_0];\n"
++    "	ld.param.u32 	%r13, [rgb10a2_to_yuv_param_1];\n"
++    "	ld.param.u64 	%rd8, [rgb10a2_to_yuv_param_2];\n"
++    "	ld.param.u32 	%r14, [rgb10a2_to_yuv_param_3];\n"
++    "	ld.param.u64 	%rd9, [rgb10a2_to_yuv_param_4];\n"
++    "	ld.param.u32 	%r15, [rgb10a2_to_yuv_param_5];\n"
++    "	ld.param.u32 	%r16, [rgb10a2_to_yuv_param_6];\n"
++    "	ld.param.u32 	%r17, [rgb10a2_to_yuv_param_7];\n"
++    "	ld.param.u32 	%r18, [rgb10a2_to_yuv_param_8];\n"
++    "	ld.param.u32 	%r19, [rgb10a2_to_yuv_param_9];\n"
++    "	ld.param.f32 	%f31, [rgb10a2_to_yuv_param_10];\n"
++    "	ld.param.f32 	%f32, [rgb10a2_to_yuv_param_11];\n"
++    "	cvta.to.global.u64 	%rd1, %rd9;\n"
++    "	cvta.to.global.u64 	%rd2, %rd8;\n"
++    "	cvta.to.global.u64 	%rd3, %rd7;\n"
++    "	mov.u32 	%r20, %ntid.x;\n"
++    "	mov.u32 	%r21, %ctaid.x;\n"
++    "	mov.u32 	%r22, %tid.x;\n"
++    "	mad.lo.s32 	%r1, %r21, %r20, %r22;\n"
++    "	mov.u32 	%r23, %ntid.y;\n"
++    "	mov.u32 	%r24, %ctaid.y;\n"
++    "	mov.u32 	%r25, %tid.y;\n"
++    "	mad.lo.s32 	%r2, %r24, %r23, %r25;\n"
++    "	setp.ge.s32 	%p1, %r1, %r16;\n"
++    "	setp.ge.s32 	%p2, %r2, %r17;\n"
++    "	or.pred  	%p3, %p1, %p2;\n"
++    "	@%p3 bra 	$L__BB3_20;\n"
++    "\n"
++    "	mov.f32 	%f33, 0f3F800000;\n"
++    "	sub.f32 	%f1, %f33, %f31;\n"
++    "	sub.f32 	%f2, %f1, %f32;\n"
++    "	mul.lo.s32 	%r3, %r2, %r13;\n"
++    "	cvt.s64.s32 	%rd10, %r3;\n"
++    "	add.s64 	%rd11, %rd3, %rd10;\n"
++    "	cvt.s64.s32 	%rd4, %r1;\n"
++    "	mul.wide.s32 	%rd12, %r1, 4;\n"
++    "	add.s64 	%rd5, %rd11, %rd12;\n"
++    "	ld.global.u32 	%r26, [%rd5];\n"
++    "	and.b32  	%r27, %r26, 1023;\n"
++    "	cvt.rn.f32.u32 	%f34, %r27;\n"
++    "	mul.f32 	%f35, %f34, 0f3A802008;\n"
++    "	shr.u32 	%r28, %r26, 10;\n"
++    "	and.b32  	%r29, %r28, 1023;\n"
++    "	cvt.rn.f32.u32 	%f36, %r29;\n"
++    "	mul.f32 	%f37, %f36, 0f3A802008;\n"
++    "	shr.u32 	%r30, %r26, 20;\n"
++    "	and.b32  	%r31, %r30, 1023;\n"
++    "	cvt.rn.f32.u32 	%f38, %r31;\n"
++    "	mul.f32 	%f39, %f38, 0f3A802008;\n"
++    "	mul.f32 	%f40, %f2, %f37;\n"
++    "	fma.rn.f32 	%f41, %f35, %f31, %f40;\n"
++    "	fma.rn.f32 	%f3, %f39, %f32, %f41;\n"
++    "	setp.eq.s32 	%p4, %r19, 0;\n"
++    "	@%p4 bra 	$L__BB3_3;\n"
++    "\n"
++    "	setp.eq.s32 	%p5, %r18, 0;\n"
++    "	selp.f32 	%f42, 0f41800000, 0f45800000, %p5;\n"
++    "	selp.f32 	%f43, 0f435B0000, 0f475B0000, %p5;\n"
++    "	setp.gt.f32 	%p6, %f3, 0f3F800000;\n"
++    "	selp.f32 	%f44, 0f3F800000, %f3, %p6;\n"
++    "	setp.lt.f32 	%p7, %f3, 0f00000000;\n"
++    "	selp.f32 	%f45, 0f00000000, %f44, %p7;\n"
++    "	fma.rn.f32 	%f122, %f43, %f45, %f42;\n"
++    "	bra.uni 	$L__BB3_4;\n"
++    "\n"
++    "$L__BB3_3:\n"
++    "	setp.lt.f32 	%p8, %f3, 0f00000000;\n"
++    "	setp.gt.f32 	%p9, %f3, 0f3F800000;\n"
++    "	selp.f32 	%f46, 0f3F800000, %f3, %p9;\n"
++    "	selp.f32 	%f47, 0f00000000, %f46, %p8;\n"
++    "	setp.eq.s32 	%p10, %r18, 0;\n"
++    "	selp.f32 	%f48, 0f437F0000, 0f477FFF00, %p10;\n"
++    "	mul.f32 	%f122, %f48, %f47;\n"
++    "\n"
++    "$L__BB3_4:\n"
++    "	add.f32 	%f49, %f122, 0f3F000000;\n"
++    "	cvt.rzi.u32.f32 	%r4, %f49;\n"
++    "	setp.eq.s32 	%p11, %r18, 0;\n"
++    "	@%p11 bra 	$L__BB3_6;\n"
++    "\n"
++    "	shr.s32 	%r32, %r14, 1;\n"
++    "	mad.lo.s32 	%r33, %r32, %r2, %r1;\n"
++    "	mul.wide.s32 	%rd13, %r33, 2;\n"
++    "	add.s64 	%rd14, %rd2, %rd13;\n"
++    "	st.global.u16 	[%rd14], %r4;\n"
++    "	bra.uni 	$L__BB3_7;\n"
++    "\n"
++    "$L__BB3_6:\n"
++    "	mad.lo.s32 	%r34, %r2, %r14, %r1;\n"
++    "	cvt.s64.s32 	%rd15, %r34;\n"
++    "	add.s64 	%rd16, %rd2, %rd15;\n"
++    "	st.global.u8 	[%rd16], %r4;\n"
++    "\n"
++    "$L__BB3_7:\n"
++    "	and.b32  	%r35, %r1, 1;\n"
++    "	setp.eq.b32 	%p12, %r35, 1;\n"
++    "	and.b32  	%r36, %r2, 1;\n"
++    "	setp.eq.b32 	%p13, %r36, 1;\n"
++    "	or.pred  	%p14, %p13, %p12;\n"
++    "	mov.pred 	%p15, 0;\n"
++    "	xor.pred  	%p16, %p14, %p15;\n"
++    "	@%p16 bra 	$L__BB3_20;\n"
++    "\n"
++    "	mov.f32 	%f50, 0f3F800000;\n"
++    "	sub.f32 	%f51, %f50, %f32;\n"
++    "	add.f32 	%f7, %f51, %f51;\n"
++    "	ld.global.u32 	%r38, [%rd5];\n"
++    "	and.b32  	%r39, %r38, 1023;\n"
++    "	cvt.rn.f32.u32 	%f52, %r39;\n"
++    "	mul.f32 	%f53, %f52, 0f3A802008;\n"
++    "	shr.u32 	%r40, %r38, 10;\n"
++    "	and.b32  	%r41, %r40, 1023;\n"
++    "	cvt.rn.f32.u32 	%f54, %r41;\n"
++    "	mul.f32 	%f55, %f54, 0f3A802008;\n"
++    "	shr.u32 	%r42, %r38, 20;\n"
++    "	and.b32  	%r43, %r42, 1023;\n"
++    "	cvt.rn.f32.u32 	%f56, %r43;\n"
++    "	mul.f32 	%f57, %f56, 0f3A802008;\n"
++    "	mul.f32 	%f58, %f2, %f55;\n"
++    "	fma.rn.f32 	%f59, %f53, %f31, %f58;\n"
++    "	fma.rn.f32 	%f60, %f57, %f32, %f59;\n"
++    "	sub.f32 	%f61, %f57, %f60;\n"
++    "	div.rn.f32 	%f62, %f61, %f7;\n"
++    "	add.f32 	%f125, %f62, 0f00000000;\n"
++    "	sub.f32 	%f63, %f53, %f60;\n"
++    "	add.f32 	%f9, %f1, %f1;\n"
++    "	div.rn.f32 	%f64, %f63, %f9;\n"
++    "	add.f32 	%f126, %f64, 0f00000000;\n"
++    "	add.s32 	%r5, %r1, 1;\n"
++    "	mov.u32 	%r72, 1;\n"
++    "	setp.ge.s32 	%p17, %r5, %r16;\n"
++    "	@%p17 bra 	$L__BB3_10;\n"
++    "\n"
++    "	ld.global.u32 	%r45, [%rd5+4];\n"
++    "	and.b32  	%r46, %r45, 1023;\n"
++    "	cvt.rn.f32.u32 	%f65, %r46;\n"
++    "	mul.f32 	%f66, %f65, 0f3A802008;\n"
++    "	shr.u32 	%r47, %r45, 10;\n"
++    "	and.b32  	%r48, %r47, 1023;\n"
++    "	cvt.rn.f32.u32 	%f67, %r48;\n"
++    "	mul.f32 	%f68, %f67, 0f3A802008;\n"
++    "	shr.u32 	%r49, %r45, 20;\n"
++    "	and.b32  	%r50, %r49, 1023;\n"
++    "	cvt.rn.f32.u32 	%f69, %r50;\n"
++    "	mul.f32 	%f70, %f69, 0f3A802008;\n"
++    "	mul.f32 	%f71, %f2, %f68;\n"
++    "	fma.rn.f32 	%f72, %f66, %f31, %f71;\n"
++    "	fma.rn.f32 	%f73, %f70, %f32, %f72;\n"
++    "	sub.f32 	%f74, %f70, %f73;\n"
++    "	div.rn.f32 	%f75, %f74, %f7;\n"
++    "	add.f32 	%f125, %f125, %f75;\n"
++    "	sub.f32 	%f76, %f66, %f73;\n"
++    "	div.rn.f32 	%f77, %f76, %f9;\n"
++    "	add.f32 	%f126, %f126, %f77;\n"
++    "	mov.u32 	%r72, 2;\n"
++    "\n"
++    "$L__BB3_10:\n"
++    "	add.s32 	%r7, %r2, 1;\n"
++    "	setp.ge.s32 	%p18, %r7, %r17;\n"
++    "	add.s32 	%r51, %r3, %r13;\n"
++    "	cvt.s64.s32 	%rd17, %r51;\n"
++    "	add.s64 	%rd18, %rd3, %rd17;\n"
++    "	shl.b64 	%rd19, %rd4, 2;\n"
++    "	add.s64 	%rd6, %rd18, %rd19;\n"
++    "	@%p18 bra 	$L__BB3_12;\n"
++    "\n"
++    "	ld.global.u32 	%r52, [%rd6];\n"
++    "	and.b32  	%r53, %r52, 1023;\n"
++    "	cvt.rn.f32.u32 	%f78, %r53;\n"
++    "	mul.f32 	%f79, %f78, 0f3A802008;\n"
++    "	shr.u32 	%r54, %r52, 10;\n"
++    "	and.b32  	%r55, %r54, 1023;\n"
++    "	cvt.rn.f32.u32 	%f80, %r55;\n"
++    "	mul.f32 	%f81, %f80, 0f3A802008;\n"
++    "	shr.u32 	%r56, %r52, 20;\n"
++    "	and.b32  	%r57, %r56, 1023;\n"
++    "	cvt.rn.f32.u32 	%f82, %r57;\n"
++    "	mul.f32 	%f83, %f82, 0f3A802008;\n"
++    "	mul.f32 	%f84, %f2, %f81;\n"
++    "	fma.rn.f32 	%f85, %f79, %f31, %f84;\n"
++    "	fma.rn.f32 	%f86, %f83, %f32, %f85;\n"
++    "	sub.f32 	%f87, %f83, %f86;\n"
++    "	div.rn.f32 	%f88, %f87, %f7;\n"
++    "	add.f32 	%f125, %f125, %f88;\n"
++    "	sub.f32 	%f89, %f79, %f86;\n"
++    "	div.rn.f32 	%f90, %f89, %f9;\n"
++    "	add.f32 	%f126, %f126, %f90;\n"
++    "	add.s32 	%r72, %r72, 1;\n"
++    "\n"
++    "$L__BB3_12:\n"
++    "	or.pred  	%p21, %p18, %p17;\n"
++    "	@%p21 bra 	$L__BB3_14;\n"
++    "\n"
++    "	ld.global.u32 	%r58, [%rd6+4];\n"
++    "	and.b32  	%r59, %r58, 1023;\n"
++    "	cvt.rn.f32.u32 	%f91, %r59;\n"
++    "	mul.f32 	%f92, %f91, 0f3A802008;\n"
++    "	shr.u32 	%r60, %r58, 10;\n"
++    "	and.b32  	%r61, %r60, 1023;\n"
++    "	cvt.rn.f32.u32 	%f93, %r61;\n"
++    "	mul.f32 	%f94, %f93, 0f3A802008;\n"
++    "	shr.u32 	%r62, %r58, 20;\n"
++    "	and.b32  	%r63, %r62, 1023;\n"
++    "	cvt.rn.f32.u32 	%f95, %r63;\n"
++    "	mul.f32 	%f96, %f95, 0f3A802008;\n"
++    "	mul.f32 	%f97, %f2, %f94;\n"
++    "	fma.rn.f32 	%f98, %f92, %f31, %f97;\n"
++    "	fma.rn.f32 	%f99, %f96, %f32, %f98;\n"
++    "	sub.f32 	%f100, %f96, %f99;\n"
++    "	div.rn.f32 	%f101, %f100, %f7;\n"
++    "	add.f32 	%f125, %f125, %f101;\n"
++    "	sub.f32 	%f102, %f92, %f99;\n"
++    "	div.rn.f32 	%f103, %f102, %f9;\n"
++    "	add.f32 	%f126, %f126, %f103;\n"
++    "	add.s32 	%r72, %r72, 1;\n"
++    "\n"
++    "$L__BB3_14:\n"
++    "	cvt.rn.f32.s32 	%f104, %r72;\n"
++    "	div.rn.f32 	%f23, %f125, %f104;\n"
++    "	div.rn.f32 	%f24, %f126, %f104;\n"
++    "	@%p4 bra 	$L__BB3_16;\n"
++    "\n"
++    "	setp.ne.s32 	%p23, %r18, 0;\n"
++    "	selp.f32 	%f105, 0f47000000, 0f43000000, %p23;\n"
++    "	selp.f32 	%f106, 0f43600000, 0f47600000, %p11;\n"
++    "	selp.f32 	%f107, 0f437F0000, 0f477FFF00, %p11;\n"
++    "	fma.rn.f32 	%f108, %f106, %f23, %f105;\n"
++    "	fma.rn.f32 	%f109, %f106, %f24, %f105;\n"
++    "	setp.lt.f32 	%p25, %f108, 0f00000000;\n"
++    "	setp.gt.f32 	%p26, %f108, %f107;\n"
++    "	selp.f32 	%f110, %f107, %f108, %p26;\n"
++    "	selp.f32 	%f129, 0f00000000, %f110, %p25;\n"
++    "	setp.lt.f32 	%p27, %f109, 0f00000000;\n"
++    "	setp.gt.f32 	%p28, %f109, %f107;\n"
++    "	selp.f32 	%f111, %f107, %f109, %p28;\n"
++    "	selp.f32 	%f130, 0f00000000, %f111, %p27;\n"
++    "	bra.uni 	$L__BB3_17;\n"
++    "\n"
++    "$L__BB3_16:\n"
++    "	setp.ne.s32 	%p29, %r18, 0;\n"
++    "	selp.f32 	%f112, 0f477FFF00, 0f437F0000, %p29;\n"
++    "	selp.f32 	%f113, 0f43000000, 0f47000000, %p11;\n"
++    "	fma.rn.f32 	%f114, %f112, %f23, %f113;\n"
++    "	fma.rn.f32 	%f115, %f112, %f24, %f113;\n"
++    "	setp.lt.f32 	%p31, %f114, 0f00000000;\n"
++    "	setp.gt.f32 	%p32, %f114, %f112;\n"
++    "	selp.f32 	%f116, %f112, %f114, %p32;\n"
++    "	selp.f32 	%f129, 0f00000000, %f116, %p31;\n"
++    "	setp.lt.f32 	%p33, %f115, 0f00000000;\n"
++    "	setp.gt.f32 	%p34, %f115, %f112;\n"
++    "	selp.f32 	%f117, %f112, %f115, %p34;\n"
++    "	selp.f32 	%f130, 0f00000000, %f117, %p33;\n"
++    "\n"
++    "$L__BB3_17:\n"
++    "	shr.s32 	%r12, %r2, 1;\n"
++    "	@%p11 bra 	$L__BB3_19;\n"
++    "\n"
++    "	shr.s32 	%r64, %r15, 1;\n"
++    "	mad.lo.s32 	%r65, %r64, %r12, %r1;\n"
++    "	add.f32 	%f118, %f129, 0f3F000000;\n"
++    "	cvt.rzi.u32.f32 	%r66, %f118;\n"
++    "	mul.wide.s32 	%rd20, %r65, 2;\n"
++    "	add.s64 	%rd21, %rd1, %rd20;\n"
++    "	st.global.u16 	[%rd21], %r66;\n"
++    "	add.f32 	%f119, %f130, 0f3F000000;\n"
++    "	cvt.rzi.u32.f32 	%r67, %f119;\n"
++    "	st.global.u16 	[%rd21+2], %r67;\n"
++    "	bra.uni 	$L__BB3_20;\n"
++    "\n"
++    "$L__BB3_19:\n"
++    "	add.f32 	%f120, %f129, 0f3F000000;\n"
++    "	cvt.rzi.u32.f32 	%r68, %f120;\n"
++    "	mad.lo.s32 	%r69, %r12, %r15, %r1;\n"
++    "	cvt.s64.s32 	%rd22, %r69;\n"
++    "	add.s64 	%rd23, %rd1, %rd22;\n"
++    "	st.global.u8 	[%rd23], %r68;\n"
++    "	add.f32 	%f121, %f130, 0f3F000000;\n"
++    "	cvt.rzi.u32.f32 	%r70, %f121;\n"
++    "	st.global.u8 	[%rd23+1], %r70;\n"
++    "\n"
++    "$L__BB3_20:\n"
++    "	ret;\n"
++    "\n"
++    "}\n";
+-- 
+2.54.0.windows.1
+
