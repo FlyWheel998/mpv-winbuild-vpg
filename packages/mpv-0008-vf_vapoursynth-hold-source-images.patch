@@ -1,0 +1,199 @@
+From c5ba8a6d42902ec6c83a4177afd118f96d408381 Mon Sep 17 00:00:00 2001
+From: VideoPlayerGold snapshot <jestar001@gmail.com>
+Date: Sun, 4 Oct 2026 18:50:15 -0400
+Subject: [PATCH] vf_vapoursynth: hold source images by reference, not by a
+ pointer in the frame props
+
+The filtered frame's attributes (colour, HDR/Dolby Vision metadata, ICC, film grain) were taken from a
+raw mp_image pointer stored in the VS frame props ("_MP_IMAGE", no reference held). When a slow,
+strictly ordered script let requests run past the input buffer, the buffered image was freed before
+the filtered frame came back, and vs_frame_done copied freed memory -> access violation in
+VSThreadPool::returnFrame. The same image could also be drained by another VS thread while
+infiltGetFrame was still copying it after dropping the lock.
+
+Now the source image is referenced under the lock, kept in a ring sized for the input buffer plus all
+requests in flight, and only its frame number travels in the props ("_MP_FRAMENO"). If the image is no
+longer held, the configured input format is used (the pre-2024 behaviour) with a warning.
+---
+ video/filter/vf_vapoursynth.c | 93 ++++++++++++++++++++++++++++++-----
+ 1 file changed, 81 insertions(+), 12 deletions(-)
+
+diff --git a/video/filter/vf_vapoursynth.c b/video/filter/vf_vapoursynth.c
+index 79b52dbc4b..4cc11494f3 100644
+--- a/video/filter/vf_vapoursynth.c
++++ b/video/filter/vf_vapoursynth.c
+@@ -103,6 +103,13 @@ struct priv {
+     int64_t frames_sent;        // total nr. of frames ever added to input queue
+     bool initializing;          // filters are being built
+     bool in_node_active;        // node might still be called
++    // Source images handed to VS, kept by reference and looked up by frame number when the filtered
++    // frame comes back (its metadata - colour, HDR, Dolby Vision, ICC - is copied from them). Only the
++    // frame number travels in the VS frame props: a raw mp_image pointer there outlived the image when a
++    // slow, strictly ordered script let requests run past the input buffer (use-after-free).
++    struct mp_image **keep;     // ring, slot = frameno % num_keep
++    int64_t *keep_no;           // frame number held in each slot, -1 = empty
++    int num_keep;
+ };
+ 
+ // priv->requested[n] points to this if a request for frame n is in-progress
+@@ -200,20 +207,49 @@ static void copy_mp_to_vs_frame_props_map(struct priv *p, VSMap *map,
+     if (img->fields & MP_IMGFIELD_INTERLACED)
+         field = img->fields & MP_IMGFIELD_TOP_FIRST ? 2 : 1;
+     p->vsapi->mapSetInt(map, "_FieldBased", field, 0);
++}
++
++// --- source-image keep ring (all three: call with p->lock held) ---
++static void keep_clear(struct priv *p)
++{
++    for (int n = 0; n < p->num_keep; n++) {
++        mp_image_unrefp(&p->keep[n]);
++        p->keep_no[n] = -1;
++    }
++}
++
++static void keep_add(struct priv *p, int64_t frameno, struct mp_image *img)
++{
++    if (!p->num_keep || frameno < 0)
++        return;
++    int slot = frameno % p->num_keep;
++    mp_image_unrefp(&p->keep[slot]);
++    p->keep[slot] = mp_image_new_ref(img);
++    p->keep_no[slot] = p->keep[slot] ? frameno : -1;
++}
+ 
+-    // Don't increase the reference count. It is not intended to be read externally,
+-    // and we know it will be alive when we retrieve it.
+-    p->vsapi->mapSetData(map, "_MP_IMAGE", (const char *)img, sizeof(*img), dtBinary, 0);
++// Returns a new reference (caller frees), or NULL if that frame is no longer held.
++static struct mp_image *keep_get_ref(struct priv *p, int64_t frameno)
++{
++    if (!p->num_keep || frameno < 0)
++        return NULL;
++    int slot = frameno % p->num_keep;
++    if (p->keep_no[slot] != frameno || !p->keep[slot])
++        return NULL;
++    return mp_image_new_ref(p->keep[slot]);
+ }
+ 
+ static int set_vs_frame_props(struct priv *p, VSFrame *frame,
+-                              struct mp_image *img, int dur_num, int dur_den)
++                              struct mp_image *img, int dur_num, int dur_den,
++                              int64_t frameno)
+ {
+     VSMap *map = p->vsapi->getFramePropertiesRW(frame);
+     if (!map)
+         return -1;
+     p->vsapi->mapSetInt(map, "_DurationNum", dur_num, 0);
+     p->vsapi->mapSetInt(map, "_DurationDen", dur_den, 0);
++    // Which source image the attributes come from; resolved through the keep ring (-1 = none).
++    p->vsapi->mapSetInt(map, "_MP_FRAMENO", frameno, 0);
+     copy_mp_to_vs_frame_props_map(p, map, img);
+     return 0;
+ }
+@@ -272,15 +308,29 @@ static void VS_CC vs_frame_done(void *userData, const VSFrame *f, int n,
+         const VSMap *map = p->vsapi->getFramePropertiesRO(f);
+         if (!map)
+             MP_ERR(p, "Failed to get frame properties!");
++        // Source attributes: a held reference to the source image, never a pointer stored in the props.
+         struct mp_image *mpi = NULL;
++        struct mp_image fallback = {0};
+         if (map) {
+-            mpi = (void *)p->vsapi->mapGetData(map, "_MP_IMAGE", 0, NULL);
+-            if (!mpi)
+-                MP_ERR(p, "Failed to get mp_image attributes!");
++            int err = 0;
++            int64_t srcno = p->vsapi->mapGetInt(map, "_MP_FRAMENO", 0, &err);
++            if (!err && srcno >= 0) {
++                mp_mutex_lock(&p->lock);
++                mpi = keep_get_ref(p, srcno);
++                mp_mutex_unlock(&p->lock);
++                if (!mpi)
++                    MP_WARN(p, "Source frame %"PRId64" no longer held; using the stream's "
++                            "format for frame %d.\n", srcno, n);
++            }
++        }
++        if (!mpi) {
++            // Same fallback as before per-frame attributes existed: the configured input format.
++            mp_image_set_params(&fallback, &p->fmt_in);
+         }
+-        struct mp_image img = map_vs_frame(p, f, false, mpi);
++        struct mp_image img = map_vs_frame(p, f, false, mpi ? mpi : &fallback);
+         img.pkt_duration = -1;
+-        if (mpi && (mpi->params.w != img.w || mpi->params.h != img.h))
++        struct mp_image *src = mpi ? mpi : &fallback;
++        if (src->params.w != img.w || src->params.h != img.h)
+             img.params.crop = (struct mp_rect){0, 0, img.w, img.h};
+         if (map) {
+             int err1, err2;
+@@ -295,6 +345,7 @@ static void VS_CC vs_frame_done(void *userData, const VSFrame *f, int n,
+             img.nominal_fps = 1.0 / img.pkt_duration;
+         }
+         res = mp_image_new_copy(&img);
++        talloc_free(mpi);
+         p->vsapi->freeFrame(f);
+     }
+ 
+@@ -474,7 +525,7 @@ static const VSFrame *VS_CC infiltGetFrame(int frameno, int activationReason,
+             mp_image_clear(&vsframe, 0, 0, p->fmt_in.w, p->fmt_in.h);
+             struct mp_image dummy = {0};
+             mp_image_set_params(&dummy, &p->fmt_in);
+-            set_vs_frame_props(p, ret, &dummy, 0, 1);
++            set_vs_frame_props(p, ret, &dummy, 0, 1, -1);
+             break;
+         }
+         if (frameno < p->in_frameno) {
+@@ -510,9 +561,17 @@ static const VSFrame *VS_CC infiltGetFrame(int frameno, int activationReason,
+                 mp_filter_wakeup(p->f);
+             }
+         } else {
+-            struct mp_image *img = p->buffered[frameno - p->in_frameno];
++            // Take a reference while the lock is held: once it is released, another VS thread asking for
++            // a later frame can drain (free) this buffered image while it is still being copied.
++            struct mp_image *img = mp_image_new_ref(p->buffered[frameno - p->in_frameno]);
++            if (!img) {
++                p->vsapi->setFilterError("Could not reference the source frame", frameCtx);
++                break;
++            }
++            keep_add(p, frameno, img);
+             ret = alloc_vs_frame(p, &img->params);
+             if (!ret) {
++                talloc_free(img);
+                 p->vsapi->setFilterError("Could not allocate VS frame", frameCtx);
+                 break;
+             }
+@@ -522,7 +581,8 @@ static const VSFrame *VS_CC infiltGetFrame(int frameno, int activationReason,
+             mp_image_copy(&vsframe, img);
+             int res = 1e6;
+             int dur = img->pkt_duration * res + 0.5;
+-            set_vs_frame_props(p, ret, img, dur, res);
++            set_vs_frame_props(p, ret, img, dur, res, frameno);
++            talloc_free(img);
+             mp_mutex_lock(&p->lock);
+             break;
+         }
+@@ -595,6 +655,8 @@ static void destroy_vs(struct priv *p)
+     for (int n = 0; n < p->num_buffered; n++)
+         talloc_free(p->buffered[n]);
+     p->num_buffered = 0;
++    // Frame numbers restart at 0 below, so held source images must not be matched again.
++    keep_clear(p);
+     p->out_frameno = p->in_frameno = 0;
+     p->requested_frameno = 0;
+     p->failed = false;
+@@ -771,6 +833,13 @@ static struct mp_filter *vf_vapoursynth_create(struct mp_filter *parent,
+     int maxbuffer = p->opts->maxbuffer * p->max_requests;
+     p->buffered = talloc_array(p, struct mp_image *, maxbuffer);
+     p->requested = talloc_zero_array(p, struct mp_image *, p->max_requests);
++    // Hold every source image VS may still be filtering: the input buffer plus all requests in flight,
++    // with margin for scripts that look a few frames back or ahead.
++    p->num_keep = maxbuffer + 2 * p->max_requests + 8;
++    p->keep = talloc_zero_array(p, struct mp_image *, p->num_keep);
++    p->keep_no = talloc_array(p, int64_t, p->num_keep);
++    for (int n = 0; n < p->num_keep; n++)
++        p->keep_no[n] = -1;
+ 
+     struct mp_autoconvert *conv = mp_autoconvert_create(f);
+     if (!conv)
+-- 
+2.54.0.windows.1
+
