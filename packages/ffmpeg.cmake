@@ -116,6 +116,10 @@ ExternalProject_Add(ffmpeg
         ${ffmpeg_lto}
         --extra-cflags='-Wno-error=int-conversion'
         "--extra-libs='${ffmpeg_extra_libs}'" # -lstdc++ / -lc++ needs by libjxl and shaderc
+        # Keep FFmpeg's detailed config.log (postremovebuild deletes the build dir before logs are
+        # collected) - it records why an optional feature such as spirv_compiler was rejected.
+        COMMAND ${EXEC} cp <BINARY_DIR>/ffbuild/config.log <LOG_DIR>/ffmpeg-configlog-out.log
+        COMMAND ${EXEC} "{ echo PATH=$PATH; which -a glslc; glslc --version; } > <LOG_DIR>/ffmpeg-glslcenv-out.log 2>&1 || true"
     BUILD_COMMAND ${MAKE}
     INSTALL_COMMAND ${MAKE} install
     LOG_DOWNLOAD 1 LOG_UPDATE 1 LOG_CONFIGURE 1 LOG_BUILD 1 LOG_INSTALL 1
