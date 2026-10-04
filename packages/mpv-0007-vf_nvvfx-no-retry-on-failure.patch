@@ -1,0 +1,53 @@
+From f53ba6ab0d3e7506e35d2d34fbd3b9ac88822bbe Mon Sep 17 00:00:00 2001
+From: VideoPlayerGold <127964164+FlyWheel998@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 09:46:23 -0400
+Subject: [PATCH] vf_nvvfx: a failed effect setup is not retried per frame; one
+ warning
+
+With the TrueHDR runtime missing, CreateEffect was attempted and an error logged on every frame.
+The picture was already correct (passthrough); now the failure is remembered per effect/size and
+reported once.
+---
+ video/filter/vf_nvvfx.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/video/filter/vf_nvvfx.c b/video/filter/vf_nvvfx.c
+index f7d0a980ea..e94b3009df 100644
+--- a/video/filter/vf_nvvfx.c
++++ b/video/filter/vf_nvvfx.c
+@@ -281,6 +281,8 @@ struct priv {
+     int64_t frames_in, frames_done;
+     double ms_sum;
+     bool warned_hdr, warned_sw, warned_fmt, warned_scale, warned_thdr_hdr;
++    bool fx_failed;          // the last setup for fx_failed_key failed: do not retry per frame
++    int fx_failed_key;
+ };
+ 
+ static void fx_destroy(struct priv *p)
+@@ -596,10 +598,23 @@ static void process(struct mp_filter *f)
+     if (cu->cuCtxPushCurrent(p->ref->ctx) != CUDA_SUCCESS)
+         goto passthrough;
+ 
++    // A setup that failed once (e.g. the TrueHDR runtime is missing) is not retried for the same
++    // effect/size: retrying cost a CreateEffect per frame and logged an error 25 times a second.
++    // Any change of effect, encoding or size (new file, vf-command) gets one fresh attempt.
++    int key = (o->effect << 30) ^ (enc << 24) ^ (w << 12) ^ h ^ (ow << 4) ^ oh;
++    if (p->fx_failed && p->fx_failed_key == key) {
++        cu->cuCtxPopCurrent(&dummy);
++        goto passthrough;
++    }
+     if (!fx_ensure(f, p, o->effect, enc, w, h, ow, oh, quality)) {
++        p->fx_failed = true;
++        p->fx_failed_key = key;
++        MP_WARN(f, "nvvfx: %s is unavailable - playing the original picture\n",
++                o->effect == EFFECT_TRUEHDR ? "TrueHDR" : "VideoSuperRes");
+         cu->cuCtxPopCurrent(&dummy);
+         goto passthrough;
+     }
++    p->fx_failed = false;
+ 
+     // Output allocation, laid out exactly like the output software format.
+     struct mp_image sw = {0};
+-- 
+2.54.0.windows.1
+
