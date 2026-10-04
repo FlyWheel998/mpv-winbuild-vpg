@@ -109,6 +109,12 @@ jobs:
           # container (run 37178435716: "restricting filesystem access failed because the Landlock ruleset could not be applied").
           pacman -Sy --noconfirm --needed --disable-sandbox shaderc
           command -v glslc && glslc --version | head -1
+          set +e
+          # Diagnostic (B1): repeat FFmpeg configure's probe_glslc/check_glslc exactly and print why it passes or fails.
+          echo "which: $(which -a glslc glslang glslangValidator 2>&1 | tr '\n' ' ')"
+          glslc -v >/tmp/g1 2>&1; echo "glslc -v rc=$?: $(head -c 200 /tmp/g1)"
+          printf '#version 460\n#pragma shader_stage(compute)\n#extension GL_GOOGLE_include_directive : require\nvoid main(void) {}\n' > /tmp/t.glsl
+          glslc --target-env=vulkan1.4 --target-spv=spv1.6 -std=460 -o /tmp/t.o /tmp/t.glsl >/tmp/g2 2>&1; echo "check_glslc rc=$?: $(head -c 400 /tmp/g2)"
 
       - name: Configuring CMake & Downloading source
         run: |
