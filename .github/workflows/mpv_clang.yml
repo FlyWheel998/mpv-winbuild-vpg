@@ -139,6 +139,9 @@ jobs:
               # reset_head.sh (cleanup/postremovebuild) resolves @{u} and fails on a detached HEAD
               # (run 37178563622: "fatal: HEAD does not point to a branch").
               br=$(git -C "$d" symbolic-ref -q --short HEAD || true)
+              # A cache saved by an earlier failed run can hold a detached HEAD: re-attach to the
+              # local branch that tracks the remote (run 37178912200, cache from 37178563622).
+              [ -n "$br" ] || br=$(git -C "$d" for-each-ref --format='%(refname:short) %(upstream:short)' refs/heads | awk '$2!=""{print $1; exit}')
               if [ -n "$br" ]; then co=(checkout -q -f -B "$br" "$sha"); else co=(-c advice.detachedHead=false checkout -q -f "$sha"); fi
               if git -C "$d" "${co[@]}"; then :; else echo "LOCK FAIL: $name $sha"; fail=1; fi
             done < packages/LOCK.txt
