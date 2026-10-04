@@ -1,0 +1,93 @@
+From 6f39df2d196836e1b520ef30892d764560eae0ce Mon Sep 17 00:00:00 2001
+From: VideoPlayerGold <127964164+FlyWheel998@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 09:18:43 -0400
+Subject: [PATCH] vf_animejanai: fail open - missing/broken shim plays the
+ original picture; inactive AI slot warns
+
+Regression row R-k (PLAN_aji_port Stage R): a missing or non-DLL lib= failed filter creation and took
+the video chain down (exit 2, 'No video'); a slot whose model could not be built fell back to
+passthrough silently. Now: one error and the picture plays unchanged; a non-zero slot that ends up
+without a chain logs a warning with the backend's reason.
+---
+ video/filter/vf_animejanai.c | 41 ++++++++++++++++++++++++++----------
+ 1 file changed, 30 insertions(+), 11 deletions(-)
+
+diff --git a/video/filter/vf_animejanai.c b/video/filter/vf_animejanai.c
+index 7b40ad93dc..eed166dbc9 100644
+--- a/video/filter/vf_animejanai.c
++++ b/video/filter/vf_animejanai.c
+@@ -580,8 +580,19 @@ static bool configure_aji(struct mp_filter *vf)
+     p->rife_acc = p->rife_den;
+ 
+     if (ret == 0) {
+-        MP_VERBOSE(vf, "No chain active for %dx%d@%.3f slot %d (passthrough)\n",
+-                   p->params.w, p->params.h, p->fps, p->cur_slot);
++        // Slot 0 is the deliberate bypass; any other slot that ends here plays
++        // without AI, which the viewer must be told (regression row R-k: a
++        // corrupt model used to fall back silently).
++        const char *why = p->api.last_error ? p->api.last_error(p->aji) : NULL;
++        if (p->cur_slot != 0) {
++            MP_WARN(vf, "AI slot %d is not active for %dx%d@%.3f - playing the "
++                        "original picture%s%s\n", p->cur_slot, p->params.w,
++                    p->params.h, p->fps, why && why[0] ? ": " : "",
++                    why && why[0] ? why : "");
++        } else {
++            MP_VERBOSE(vf, "No chain active for %dx%d@%.3f slot %d (passthrough)\n",
++                       p->params.w, p->params.h, p->fps, p->cur_slot);
++        }
+         // RIFE-only chains interpolate the passthrough copies, which stay
+         // in the input format; never inherit a stale out_fmt from a
+         // previously configured upscale chain (out_params was just reset
+@@ -1898,10 +1909,18 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
+         const char *lib = p->path.lib ? p->path.lib : AJI_DEFAULT_LIB;
+         p->api.handle = aji_lib_open(lib);
+         if (!p->api.handle) {
+-            MP_ERR(f, "Failed to load inference shim '%s': %s\n", lib,
++            // Fail open (VideoPlayerGold, regression row R-k): a missing or
++            // broken shim used to fail filter creation, which took the whole
++            // video chain down ("No video", exit 2). Play the picture
++            // unchanged instead and say so once.
++            MP_ERR(f, "Failed to load inference shim '%s': %s - AI upscaling "
++                      "is off, playing the original picture\n", lib,
+                    aji_lib_error());
+-            goto fail;
++            want_aji = false;
+         }
++    }
++    if (want_aji) {
++        const char *lib = p->path.lib ? p->path.lib : AJI_DEFAULT_LIB;
+         p->api.create = aji_lib_sym(p->api.handle, "aji_create");
+         p->api.set_slot = aji_lib_sym(p->api.handle, "aji_set_slot");
+         p->api.configure = aji_lib_sym(p->api.handle, "aji_configure");
+@@ -1929,10 +1948,14 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
+             !p->api.poll ||
+             !p->api.current_log || !p->api.last_error || !p->api.destroy) {
+             MP_ERR(f, "Inference shim '%s' is missing aji_* symbols "
+-                      "(ABI version mismatch?)\n", lib);
+-            goto fail;
++                      "(ABI version mismatch?) - AI upscaling is off, playing "
++                      "the original picture\n", lib);
++            aji_lib_close(p->api.handle);
++            memset(&p->api, 0, sizeof(p->api));
++            want_aji = false;
+         }
+-        MP_VERBOSE(f, "Loaded inference shim: %s\n", lib);
++        if (want_aji)
++            MP_VERBOSE(f, "Loaded inference shim: %s\n", lib);
+     }
+ 
+     // The CUDA device is adopted from the first input frame's
+@@ -1960,10 +1983,6 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
+     mp_refqueue_set_drop_check(p->queue, drop_pre_seek_target, f);
+ 
+     return f;
+-
+-fail:
+-    talloc_free(f);
+-    return NULL;
+ }
+ 
+ #define OPT_BASE_STRUCT struct opts
+-- 
+2.54.0.windows.1
+
