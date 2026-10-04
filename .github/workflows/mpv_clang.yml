@@ -105,7 +105,9 @@ jobs:
         # time; our shaderc package is built for the target and installs no host tool. Same fix as
         # the-database/zhongfly mpv-winbuild workflows (PLAN_aji_port Stage B1, F-R417).
         run: |
-          pacman -Sy --noconfirm --needed shaderc
+          # --disable-sandbox: pacman 7's download sandbox (Landlock + user alpm) cannot be applied inside this
+          # container (run 37178435716: "restricting filesystem access failed because the Landlock ruleset could not be applied").
+          pacman -Sy --noconfirm --needed --disable-sandbox shaderc
           command -v glslc && glslc --version | head -1
 
       - name: Configuring CMake & Downloading source
