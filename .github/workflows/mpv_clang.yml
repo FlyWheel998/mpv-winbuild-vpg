@@ -106,6 +106,12 @@ jobs:
           MPV_TARBALL: ${{ github.event.inputs.mpv_tarball }}
         run: |
           ninja -C build_$BIT update
+          # Record the exact commit of every package this build used (PLAN_aji_port Stage P2), so the
+          # next stage can pin them and two builds from the same recipe are provably identical.
+          for d in src_packages/*/; do
+            if [ -d "$d/.git" ]; then echo "$(basename "$d") $(git -C "$d" rev-parse HEAD)"; else echo "$(basename "$d") no-git"; fi
+          done | sort > LOCK.txt
+          echo "LOCK.txt: $(wc -l < LOCK.txt) packages"
           # Build libdovi EXPLICITLY. ExternalProject hangs a DEPENDS edge off the dependent's
           # download/mkdir step, and libplacebo's were restored from cache and never re-ran - so
           # ninja never descended into libdovi. Five runs produced no libdovi log at all while all
@@ -147,6 +153,14 @@ jobs:
           mkdir -p build_${BIT}_logs
           cp -fr $(find build_$BIT -type f -iname "*-*.log" -or -wholename "*/ffbuild/config.log") build_${BIT}_logs || true
           7z a -m0=lzma2 -mx=9 -ms=on logs.7z build*logs
+
+      - name: Uploading package lock
+        uses: actions/upload-artifact@master
+        if: always()
+        with:
+          name: mpv-${{ matrix.bit }}-lock
+          path: LOCK.txt
+          retention-days: 30
 
       - name: Uploading logs
         uses: actions/upload-artifact@master
