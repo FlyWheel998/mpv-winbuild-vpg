@@ -135,7 +135,12 @@ jobs:
               if ! git -C "$d" cat-file -e "$sha^{commit}" 2>/dev/null; then
                 git -C "$d" fetch -q origin "$sha" || git -C "$d" fetch -q --unshallow origin || git -C "$d" fetch -q origin
               fi
-              if git -C "$d" -c advice.detachedHead=false checkout -q -f "$sha"; then :; else echo "LOCK FAIL: $name $sha"; fail=1; fi
+              # Keep HEAD on its branch (moved to the locked commit), not detached: the recipe's
+              # reset_head.sh (cleanup/postremovebuild) resolves @{u} and fails on a detached HEAD
+              # (run 37178563622: "fatal: HEAD does not point to a branch").
+              br=$(git -C "$d" symbolic-ref -q --short HEAD || true)
+              if [ -n "$br" ]; then co=(checkout -q -f -B "$br" "$sha"); else co=(-c advice.detachedHead=false checkout -q -f "$sha"); fi
+              if git -C "$d" "${co[@]}"; then :; else echo "LOCK FAIL: $name $sha"; fail=1; fi
             done < packages/LOCK.txt
             [ $fail = 0 ] || exit 1
             echo "LOCK: $(wc -l < packages/LOCK.txt) packages pinned"
