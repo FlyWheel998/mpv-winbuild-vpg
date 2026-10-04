@@ -15,6 +15,11 @@ on:
         required: false
         default: false
         type: boolean
+      unlock:
+        description: 'UPGRADE run: move every package to its newest commit (ninja update) instead of packages/LOCK.txt. The result must pass the regression suite before it is used.'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build_mpv:
@@ -95,6 +100,14 @@ jobs:
         continue-on-error: true
         run: ${{ github.event.inputs.command }}
 
+      - name: Installing host glslc (FFmpeg spirv_compiler -> fruc_vulkan)
+        # FFmpeg enables spirv_compiler only when a HOST glslc/glslang binary is on PATH at configure
+        # time; our shaderc package is built for the target and installs no host tool. Same fix as
+        # the-database/zhongfly mpv-winbuild workflows (PLAN_aji_port Stage B1, F-R417).
+        run: |
+          pacman -Sy --noconfirm --needed shaderc
+          command -v glslc && glslc --version | head -1
+
       - name: Configuring CMake & Downloading source
         run: |
           cmake -DTARGET_ARCH=${{ env.arch }}-w64-mingw32 -DCOMPILER_TOOLCHAIN=clang ${{ env.x86_64_v3_ARCH }} -DCMAKE_INSTALL_PREFIX=$PWD/clang_root -DMINGW_INSTALL_PREFIX=$PWD/build_$BIT/$BIT-w64-mingw32 -DSINGLE_SOURCE_LOCATION=$PWD/src_packages -DRUSTUP_LOCATION=$PWD/clang_root/install_rustup -DENABLE_CCACHE=ON -DCLANG_PACKAGES_LTO=ON -G Ninja --fresh -B build_$BIT -S $PWD
@@ -104,8 +117,27 @@ jobs:
         id: build_mpv_step
         env:
           MPV_TARBALL: ${{ github.event.inputs.mpv_tarball }}
+          UNLOCK: ${{ github.event.inputs.unlock }}
         run: |
-          ninja -C build_$BIT update
+          if [ "$UNLOCK" = "true" ]; then
+            echo "UPGRADE run: every package moves to its newest commit"
+            ninja -C build_$BIT update
+          else
+            # Pinned build: put every git package at the commit recorded in packages/LOCK.txt.
+            # A package that cannot reach its commit FAILS the build - never a silent fall back to latest.
+            fail=0
+            while read -r name sha; do
+              d="src_packages/$name"
+              [ -d "$d/.git" ] || { echo "LOCK: $name has no checkout (skipped, not built from git?)"; continue; }
+              git config --global --add safe.directory "$PWD/$d"
+              if ! git -C "$d" cat-file -e "$sha^{commit}" 2>/dev/null; then
+                git -C "$d" fetch -q origin "$sha" || git -C "$d" fetch -q --unshallow origin || git -C "$d" fetch -q origin
+              fi
+              if git -C "$d" -c advice.detachedHead=false checkout -q -f "$sha"; then :; else echo "LOCK FAIL: $name $sha"; fail=1; fi
+            done < packages/LOCK.txt
+            [ $fail = 0 ] || exit 1
+            echo "LOCK: $(wc -l < packages/LOCK.txt) packages pinned"
+          fi
           # Record the exact commit of every package this build used (PLAN_aji_port Stage P2), so the
           # next stage can pin them and two builds from the same recipe are provably identical.
           for d in src_packages/*/; do
