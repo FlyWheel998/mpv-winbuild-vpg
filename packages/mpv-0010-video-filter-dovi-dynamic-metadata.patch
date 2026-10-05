@@ -1,0 +1,78 @@
+From 8a02fd0396ffd02a4ba88b0821c5b5bfb8ba1224 Mon Sep 17 00:00:00 2001
+From: FlyWheel998 <127964164+FlyWheel998@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 03:07:04 -0400
+Subject: [PATCH] video/filter: take each frame's own Dolby Vision/HDR dynamic
+ metadata after out_params
+
+vf_animejanai, vf_dlssnr and vf_d3d11vpp copy the input attributes and then
+overwrite out->params with out_params cached at (re)configure time. Those
+params hold repr.dovi, a pointer into the Dolby Vision RPU of the frame seen
+then, so every later output frame pointed at a freed buffer. After a reload
+the memory is reused and libplacebo aborts on 'num_pivots >= 2 && <= 9'
+(colorspace.c:171) or faults reading it. Refresh the dynamic metadata from
+the current input with mp_image_params_update_dynamic().
+---
+ video/filter/vf_animejanai.c | 8 ++++++++
+ video/filter/vf_d3d11vpp.c   | 4 ++++
+ video/filter/vf_dlssnr.c     | 4 ++++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/video/filter/vf_animejanai.c b/video/filter/vf_animejanai.c
+index eed166dbc9..30bed265df 100644
+--- a/video/filter/vf_animejanai.c
++++ b/video/filter/vf_animejanai.c
+@@ -832,6 +832,10 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in)
+         return false;
+     mp_image_copy_attributes(out, in);
+     out->params = p->out_params;
++    // The cached out_params carry the repr.dovi pointer and HDR metadata of the frame seen at
++    // (re)configure time; that frame is long gone. Take this frame's own dynamic metadata, or
++    // libplacebo dereferences a freed Dolby Vision RPU (assert num_pivots / access violation).
++    mp_image_params_update_dynamic(&out->params, &in->params, false);
+     out->pts = in->pts;
+ 
+     const int mat = map_matrix(&p->params);
+@@ -973,6 +977,10 @@ static struct mp_image *render(struct mp_filter *vf)
+ 
+     mp_image_copy_attributes(out, in);
+     out->params = p->out_params;
++    // The cached out_params carry the repr.dovi pointer and HDR metadata of the frame seen at
++    // (re)configure time; that frame is long gone. Take this frame's own dynamic metadata, or
++    // libplacebo dereferences a freed Dolby Vision RPU (assert num_pivots / access violation).
++    mp_image_params_update_dynamic(&out->params, &in->params, false);
+     out->pts = in->pts;
+ 
+ #if HAVE_D3D11
+diff --git a/video/filter/vf_d3d11vpp.c b/video/filter/vf_d3d11vpp.c
+index def05ddd37..9fa614b92c 100644
+--- a/video/filter/vf_d3d11vpp.c
++++ b/video/filter/vf_d3d11vpp.c
+@@ -590,6 +590,10 @@ static struct mp_image *render(struct mp_filter *vf)
+     mp_image_copy_attributes(out, in);
+     // TODO: sanitize out_params based the processing enabled.
+     out->params = p->out_params;
++    // The cached out_params carry the repr.dovi pointer and HDR metadata of the frame seen at
++    // (re)configure time; that frame is long gone. Take this frame's own dynamic metadata, or
++    // libplacebo dereferences a freed Dolby Vision RPU (assert num_pivots / access violation).
++    mp_image_params_update_dynamic(&out->params, &in->params, false);
+ 
+     D3D11_VIDEO_FRAME_FORMAT d3d_frame_format;
+     if (!mp_refqueue_should_deint(p->queue)) {
+diff --git a/video/filter/vf_dlssnr.c b/video/filter/vf_dlssnr.c
+index d039121cb6..a2a6d3b443 100644
+--- a/video/filter/vf_dlssnr.c
++++ b/video/filter/vf_dlssnr.c
+@@ -480,6 +480,10 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in)
+         return false;
+     mp_image_copy_attributes(out, in);
+     out->params = p->out_params;
++    // The cached out_params carry the repr.dovi pointer and HDR metadata of the frame seen at
++    // (re)configure time; that frame is long gone. Take this frame's own dynamic metadata, or
++    // libplacebo dereferences a freed Dolby Vision RPU (assert num_pivots / access violation).
++    mp_image_params_update_dynamic(&out->params, &in->params, false);
+     out->pts = in->pts;
+ 
+     CUcontext dummy;
+-- 
+2.54.0.windows.1
+
