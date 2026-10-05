@@ -1,0 +1,938 @@
+From bd7571783ae918033d40b23d91d6bd2a8e095995 Mon Sep 17 00:00:00 2001
+From: VideoPlayerGold snapshot <jestar001@gmail.com>
+Date: Sun, 4 Oct 2026 21:37:22 -0400
+Subject: [PATCH] vf_dlssnr: GPU-resident neural relight filter through a
+ runtime host library
+
+Plumbing only (CUDA nv12/p010 in, own pool out, ordered after decode on a
+private stream, up to 3 frames in flight, fail-open). Colour conversion,
+the network and the optional round-trip downscale live in a host library
+loaded at runtime across the C ABI in nrhost.h.
+---
+ filters/user_filters.c   |   1 +
+ filters/user_filters.h   |   1 +
+ meson.build              |   1 +
+ video/filter/nrhost.h    |  87 +++++
+ video/filter/vf_dlssnr.c | 780 +++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 870 insertions(+)
+ create mode 100644 video/filter/nrhost.h
+ create mode 100644 video/filter/vf_dlssnr.c
+
+diff --git a/filters/user_filters.c b/filters/user_filters.c
+index 5315f4fc00..122412b277 100644
+--- a/filters/user_filters.c
++++ b/filters/user_filters.c
+@@ -103,6 +103,7 @@ const struct mp_user_filter_entry *vf_list[] = {
+ #endif
+ #if HAVE_CUDA_HWACCEL
+     &vf_animejanai,
++    &vf_dlssnr,
+ #endif
+ #if HAVE_AMF
+     &vf_amf_frc,
+diff --git a/filters/user_filters.h b/filters/user_filters.h
+index 4fb06c1f8c..eb0f71bdf5 100644
+--- a/filters/user_filters.h
++++ b/filters/user_filters.h
+@@ -37,6 +37,7 @@ extern const struct mp_user_filter_entry vf_vdpaupp;
+ extern const struct mp_user_filter_entry vf_vavpp;
+ extern const struct mp_user_filter_entry vf_d3d11vpp;
+ extern const struct mp_user_filter_entry vf_animejanai;
++extern const struct mp_user_filter_entry vf_dlssnr;
+ extern const struct mp_user_filter_entry vf_amf_frc;
+ extern const struct mp_user_filter_entry vf_fingerprint;
+ extern const struct mp_user_filter_entry vf_gpu;
+diff --git a/meson.build b/meson.build
+index 5d140ee9a5..9785411de6 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1402,6 +1402,7 @@ cuda_hwaccel = get_option('cuda-hwaccel').require(
+ features += {'cuda-hwaccel': cuda_hwaccel.allowed()}
+ if features['cuda-hwaccel']
+     sources += files('video/filter/vf_animejanai.c',
++                     'video/filter/vf_dlssnr.c',
+                      'video/out/hwdec/hwdec_cuda.c',
+                      'video/filter/vf_cudapass.c')
+     if win32
+diff --git a/video/filter/nrhost.h b/video/filter/nrhost.h
+new file mode 100644
+index 0000000000..2f0ff33241
+--- /dev/null
++++ b/video/filter/nrhost.h
+@@ -0,0 +1,87 @@
++/*
++ * nrhost.h - C ABI between mpv's vf_dlssnr and a neural-relight host DLL.
++ *
++ * The filter owns frames, pools and ordering; the host owns everything that
++ * runs on the frames (colour conversion, the network, the round-trip
++ * downscale). All work is enqueued on desc.cu_stream inside desc.cu_context;
++ * no call blocks on the GPU except nrh_create/nrh_destroy.
++ *
++ * This header is part of mpv (LGPL 2.1+). Hosts are separate programs.
++ */
++#ifndef NRHOST_H
++#define NRHOST_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define NRH_ABI 1
++
++enum nrh_fmt   { NRH_NV12 = 1, NRH_P010 = 2 };
++enum nrh_mat   { NRH_MAT_601 = 1, NRH_MAT_709 = 2, NRH_MAT_2020 = 3 };
++enum nrh_range { NRH_RANGE_LIMITED = 1, NRH_RANGE_FULL = 2 };
++enum nrh_trc   { NRH_TRC_SDR = 0, NRH_TRC_PQ = 1 };
++enum nrh_reset { NRH_RESET_NEVER = 0, NRH_RESET_EVERY = 1, NRH_RESET_ONCE = 2 };
++enum nrh_log   { NRH_LOG_ERROR = 0, NRH_LOG_WARN = 1, NRH_LOG_INFO = 2, NRH_LOG_DEBUG = 3 };
++
++struct nrh_desc {
++    uint32_t abi;                   // NRH_ABI
++    void *cu_context;               // CUcontext the frames live in
++    void *cu_stream;                // CUstream all work is enqueued on
++    int in_w, in_h;                 // input frame size (even)
++    int fmt;                        // enum nrh_fmt, same for input and output
++    int out_w, out_h;               // == in_w/in_h, or smaller (round-trip downscale)
++    int matrix, range, trc;         // enum nrh_mat / nrh_range / nrh_trc
++    float peak_nits;                // PQ: mastering peak for the proxy knee, 0 = 1000
++    const char *host_dir;           // directory with the host's runtime files, NULL = the DLL's own
++    void (*log)(void *opaque, int level, const char *msg);
++    void *log_opaque;
++};
++
++struct nrh_params {
++    float intensity;                // 0..1, network wet/dry
++    float local_tone;               // network local tone strength
++    float local_structure;          // network local structure strength
++    float skin_structure;           // network skin structure, -1 = model default
++    int style;
++    int auto_mask;
++    int reset;                      // enum nrh_reset; ONCE applies to the next nrh_process only
++    int hl_keep;                    // PQ: 1 = keep the source's highlights, 0 = network shapes them
++    float shadow_guard;             // PQ: max gain change below 1 % luminance (0.10)
++    int identity;                   // 1 = conversions only, no network (plumbing test)
++};
++
++struct nrh_frame {
++    uintptr_t plane[2];             // CUdeviceptr: luma, interleaved chroma
++    int pitch[2];                   // bytes
++};
++
++struct nrh;
++
++typedef uint32_t    (*nrh_abi_fn)(void);
++typedef int         (*nrh_create_fn)(const struct nrh_desc *, const struct nrh_params *, struct nrh **);
++typedef int         (*nrh_process_fn)(struct nrh *, const struct nrh_frame *in, const struct nrh_frame *out,
++                                      const struct nrh_params *);
++typedef const char *(*nrh_error_fn)(struct nrh *);
++typedef void        (*nrh_destroy_fn)(struct nrh **);
++
++#ifdef NRH_HOST_BUILD
++#define NRH_EXPORT __declspec(dllexport)
++NRH_EXPORT uint32_t    nrh_abi(void);
++// 0 on success. On failure *out is NULL and nrh_error(NULL) describes it.
++NRH_EXPORT int         nrh_create(const struct nrh_desc *, const struct nrh_params *, struct nrh **out);
++// Enqueues one frame. params may be NULL (keep the last). 0 on success.
++NRH_EXPORT int         nrh_process(struct nrh *, const struct nrh_frame *in, const struct nrh_frame *out,
++                                   const struct nrh_params *params);
++NRH_EXPORT const char *nrh_error(struct nrh *);
++NRH_EXPORT void        nrh_destroy(struct nrh **);
++#endif
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/video/filter/vf_dlssnr.c b/video/filter/vf_dlssnr.c
+new file mode 100644
+index 0000000000..df5557959c
+--- /dev/null
++++ b/video/filter/vf_dlssnr.c
+@@ -0,0 +1,780 @@
++/*
++ * vf_dlssnr: GPU-resident neural relight filter (CUDA)
++ *
++ * Plumbing only: frames stay in GPU memory (IMGFMT_CUDA nv12/p010 in, own
++ * AVHWFramesContext pool out, same format), ordered after decode on a
++ * private stream, a few frames in flight. Everything that runs on the
++ * frames - colour conversion, the network, an optional downscale - lives
++ * in a host library loaded at runtime across the C ABI in nrhost.h, so no
++ * vendor SDK links into mpv.
++ *
++ * Fail-open: a missing host, a host that refuses the stream, or repeated
++ * processing failures play the original picture with one warning.
++ *
++ * Runtime: `vf-command <label> <intensity|structure|tone|skin|shadow|hl|
++ * reset|identity|enable> <value>`.
++ *
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <stdio.h>
++
++#include "config.h"
++
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <dlfcn.h>
++#endif
++
++#include <ffnvcodec/dynlink_loader.h>
++
++#include <libavutil/hwcontext.h>
++#include <libavutil/hwcontext_cuda.h>
++#include <libavutil/pixfmt.h>
++
++#include "common/common.h"
++#include "filters/filter.h"
++#include "filters/filter_internal.h"
++#include "filters/user_filters.h"
++#include "options/m_option.h"
++#include "options/path.h"
++#include "refqueue.h"
++#include "video/fmt-conversion.h"
++#include "video/mp_image.h"
++#include "video/mp_image_pool.h"
++
++#include "nrhost.h"
++
++#ifdef _WIN32
++#define NRH_DEFAULT_LIB "~~/../dlssnr/vpg_nrhost.dll"
++#else
++#define NRH_DEFAULT_LIB "libnrhost.so"
++#endif
++
++#define MAX_DEPTH 4
++#define MAX_FAILS 3
++
++enum { RESET_EVERY, RESET_SEEK, RESET_NEVER };
++
++struct opts {
++    char *host;
++    bool enable;
++    float intensity, structure, tone, skin, shadow, peak;
++    int style;
++    bool auto_mask;
++    int reset;
++    int hdr;            // 0 auto, 1 off
++    int hl;             // 0 keep, 1 shape
++    int downscale;
++    bool identity;
++    int queue_depth;
++    bool skip_seek_pre_target;
++};
++
++struct host_api {
++    void *handle;
++    nrh_abi_fn abi;
++    nrh_create_fn create;
++    nrh_process_fn process;
++    nrh_error_fn error;
++    nrh_destroy_fn destroy;
++};
++
++struct priv {
++    struct opts *opts;
++    char *host_path;
++    struct host_api api;
++    struct nrh *nrh;
++
++    CudaFunctions *cu;
++    AVBufferRef *av_device_ref;
++    CUcontext cuda_ctx;
++    CUstream stream;
++    CUstream own_stream;
++    CUstream decode_stream;
++    CUevent decode_evt[MAX_DEPTH];
++    int decode_evt_next;
++    bool decode_evt_ok;
++    CUevent done_evt[MAX_DEPTH];
++    int done_evt_next;
++    bool done_evt_ok;
++
++    AVBufferRef *hw_pool;
++    struct mp_refqueue *queue;
++    struct mp_image_params params, out_params;
++
++    bool active;            // host created for the current stream
++    bool off;               // failed open for this filter instance (one warning given)
++    bool enabled;           // runtime enable (vf-command)
++    int fails;
++    struct nrh_params np;
++    bool reset_next;
++
++    struct {
++        struct mp_image *src;
++        struct mp_image *out;
++        CUevent done;
++    } ring[MAX_DEPTH];
++    int ring_n;
++    int depth;
++};
++
++static void *lib_open(const char *path)
++{
++#ifdef _WIN32
++    if (strpbrk(path, "/\\")) {
++        char full[MAX_PATH];
++        DWORD n = GetFullPathNameA(path, sizeof(full), full, NULL);
++        const char *p = (n > 0 && n < sizeof(full)) ? full : path;
++        return (void *)LoadLibraryExA(p, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
++                                               LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
++    }
++    return (void *)LoadLibraryA(path);
++#else
++    return dlopen(path, RTLD_NOW | RTLD_LOCAL);
++#endif
++}
++
++static void *lib_sym(void *handle, const char *name)
++{
++#ifdef _WIN32
++    return (void *)GetProcAddress((HMODULE)handle, name);
++#else
++    return dlsym(handle, name);
++#endif
++}
++
++static void lib_close(void *handle)
++{
++#ifdef _WIN32
++    FreeLibrary((HMODULE)handle);
++#else
++    dlclose(handle);
++#endif
++}
++
++static int check_cu(struct mp_filter *vf, CUresult err, const char *func)
++{
++    struct priv *p = vf->priv;
++    if (err == CUDA_SUCCESS)
++        return 0;
++    const char *err_name = NULL;
++    p->cu->cuGetErrorName(err, &err_name);
++    MP_ERR(vf, "%s failed: %s\n", func, err_name ? err_name : "unknown");
++    return -1;
++}
++
++#define CHECK_CU(x) check_cu(vf, (x), #x)
++
++static void host_log(void *opaque, int level, const char *msg)
++{
++    struct mp_filter *vf = opaque;
++    int l = level <= NRH_LOG_ERROR ? MSGL_ERR : level == NRH_LOG_WARN ? MSGL_WARN :
++            level == NRH_LOG_INFO ? MSGL_V : MSGL_DEBUG;
++    mp_msg(vf->log, l, "[host] %s\n", msg);
++}
++
++// Fail open: from here on this filter instance passes frames through.
++static void go_off(struct mp_filter *vf, const char *why)
++{
++    struct priv *p = vf->priv;
++    if (!p->off)
++        MP_WARN(vf, "%s - playing the original picture\n", why);
++    p->off = true;
++    p->active = false;
++}
++
++static void update_params(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    struct opts *o = p->opts;
++    p->np = (struct nrh_params){
++        .intensity = o->intensity,
++        .local_tone = o->tone,
++        .local_structure = o->structure,
++        .skin_structure = o->skin,
++        .style = o->style,
++        .auto_mask = o->auto_mask,
++        .reset = o->reset == RESET_EVERY ? NRH_RESET_EVERY : NRH_RESET_NEVER,
++        .hl_keep = o->hl == 0,
++        .shadow_guard = o->shadow,
++        .identity = o->identity,
++    };
++}
++
++// The network reads the decoder surface on p->stream; decode ran on
++// p->decode_stream. A private non-blocking stream is not ordered against it,
++// so record decode's progress and make our stream wait (as vf_animejanai).
++static bool order_after_decode(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    if (p->stream == p->decode_stream || !p->decode_evt_ok)
++        return true;
++    CUevent ev = p->decode_evt[p->decode_evt_next];
++    p->decode_evt_next = (p->decode_evt_next + 1) % MAX_DEPTH;
++    return CHECK_CU(p->cu->cuEventRecord(ev, p->decode_stream)) >= 0 &&
++           CHECK_CU(p->cu->cuStreamWaitEvent(p->stream, ev, 0)) >= 0;
++}
++
++static void clear_ring(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    if (p->ring_n && p->cu && p->cuda_ctx &&
++        p->cu->cuCtxPushCurrent(p->cuda_ctx) == CUDA_SUCCESS)
++    {
++        CUcontext dummy;
++        p->cu->cuEventSynchronize(p->ring[p->ring_n - 1].done);
++        p->cu->cuCtxPopCurrent(&dummy);
++    }
++    for (int i = 0; i < p->ring_n; i++)
++        mp_image_unrefp(&p->ring[i].out);
++    p->ring_n = 0;
++}
++
++static void flush_frames(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    clear_ring(vf);
++    mp_refqueue_flush(p->queue);
++    p->decode_evt_next = 0;
++    if (p->opts->reset == RESET_SEEK)
++        p->reset_next = true;
++}
++
++static void destroy_events(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    for (int i = 0; i < MAX_DEPTH; i++) {
++        if (p->decode_evt[i])
++            p->cu->cuEventDestroy(p->decode_evt[i]);
++        if (p->done_evt[i])
++            p->cu->cuEventDestroy(p->done_evt[i]);
++        p->decode_evt[i] = p->done_evt[i] = NULL;
++    }
++    p->decode_evt_ok = p->done_evt_ok = false;
++}
++
++static void release_device_state(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    clear_ring(vf);
++    if (p->nrh)
++        p->api.destroy(&p->nrh);
++    if (p->cu && p->cuda_ctx) {
++        CUcontext dummy;
++        if (p->cu->cuCtxPushCurrent(p->cuda_ctx) == CUDA_SUCCESS) {
++            if (p->own_stream)
++                p->cu->cuStreamSynchronize(p->own_stream);
++            destroy_events(vf);
++            if (p->own_stream)
++                p->cu->cuStreamDestroy(p->own_stream);
++            p->cu->cuCtxPopCurrent(&dummy);
++        }
++    }
++    av_buffer_unref(&p->hw_pool);
++    av_buffer_unref(&p->av_device_ref);
++    p->cuda_ctx = NULL;
++    p->stream = p->own_stream = p->decode_stream = NULL;
++    p->decode_evt_next = p->done_evt_next = 0;
++    p->active = false;
++    p->fails = 0;
++}
++
++static int map_matrix(const struct mp_image_params *params)
++{
++    switch (params->repr.sys) {
++    case PL_COLOR_SYSTEM_BT_601:     return NRH_MAT_601;
++    case PL_COLOR_SYSTEM_BT_2020_NC: return NRH_MAT_2020;
++    case PL_COLOR_SYSTEM_BT_709:     return NRH_MAT_709;
++    default:
++        return (params->w >= 1280 || params->h > 576) ? NRH_MAT_709 : NRH_MAT_601;
++    }
++}
++
++// Adopt the CUDA device of the incoming frames, make a private stream with
++// decode-ordering and per-frame completion events.
++static bool adopt_device(struct mp_filter *vf, struct mp_image *in_fmt)
++{
++    struct priv *p = vf->priv;
++    if (!p->cu || !in_fmt->hwctx)
++        return false;
++    AVHWFramesContext *fctx = (void *)in_fmt->hwctx->data;
++    AVHWDeviceContext *avhwctx = fctx->device_ctx;
++    if (avhwctx->type != AV_HWDEVICE_TYPE_CUDA)
++        return false;
++    p->av_device_ref = av_buffer_ref(fctx->device_ref);
++    MP_HANDLE_OOM(p->av_device_ref);
++    AVCUDADeviceContext *cudactx = avhwctx->hwctx;
++    p->cuda_ctx = cudactx->cuda_ctx;
++    p->stream = p->decode_stream = cudactx->stream;
++
++    CUcontext dummy;
++    if (CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) < 0)
++        return false;
++    bool ok = true;
++    for (int i = 0; i < MAX_DEPTH; i++)
++        ok &= CHECK_CU(p->cu->cuEventCreate(&p->done_evt[i], CU_EVENT_DISABLE_TIMING)) >= 0;
++    p->done_evt_ok = ok;
++    if (ok && !p->stream &&
++        CHECK_CU(p->cu->cuStreamCreate(&p->own_stream, CU_STREAM_NON_BLOCKING)) >= 0)
++    {
++        bool evt_ok = true;
++        for (int i = 0; i < MAX_DEPTH; i++)
++            evt_ok &= CHECK_CU(p->cu->cuEventCreate(&p->decode_evt[i],
++                                                    CU_EVENT_DISABLE_TIMING)) >= 0;
++        if (evt_ok) {
++            p->decode_evt_ok = true;
++            p->stream = p->own_stream;
++        } else {
++            // Without decode ordering the private stream would race decode:
++            // run on the decode stream instead (implicitly ordered).
++            for (int i = 0; i < MAX_DEPTH; i++) {
++                if (p->decode_evt[i])
++                    p->cu->cuEventDestroy(p->decode_evt[i]);
++                p->decode_evt[i] = NULL;
++            }
++            p->cu->cuStreamDestroy(p->own_stream);
++            p->own_stream = NULL;
++        }
++    }
++    p->cu->cuCtxPopCurrent(&dummy);
++    return p->done_evt_ok;
++}
++
++// Decide what this stream gets and create the host for it. Returns false
++// only for hard errors; "not for this stream" leaves p->active false.
++static bool configure(struct mp_filter *vf, struct mp_image *in_fmt)
++{
++    struct priv *p = vf->priv;
++    struct opts *o = p->opts;
++
++    p->params = in_fmt->params;
++    p->out_params = p->params;
++    p->active = false;
++
++    if (p->off || !p->api.handle)
++        return true;
++
++    if (!adopt_device(vf, in_fmt)) {
++        MP_WARN(vf, "input frames are not CUDA frames - passing through\n");
++        return true;
++    }
++
++    enum AVPixelFormat sw = imgfmt2pixfmt(p->params.hw_subfmt);
++    int fmt = sw == AV_PIX_FMT_NV12 ? NRH_NV12 : sw == AV_PIX_FMT_P010 ? NRH_P010 : 0;
++    if (!fmt) {
++        MP_WARN(vf, "unsupported surface format %s - passing through\n",
++                mp_imgfmt_to_name(p->params.hw_subfmt));
++        return true;
++    }
++
++    enum pl_color_transfer trc = p->params.color.transfer;
++    int ntrc = NRH_TRC_SDR;
++    if (trc == PL_COLOR_TRC_PQ) {
++        if (o->hdr == 1 || fmt != NRH_P010) {
++            MP_INFO(vf, "PQ HDR %s - passing through\n",
++                    o->hdr == 1 ? "with hdr=off" : "in 8 bits");
++            return true;
++        }
++        ntrc = NRH_TRC_PQ;
++    } else if (pl_color_transfer_is_hdr(trc)) {
++        MP_INFO(vf, "HDR transfer %s is not supported - passing through\n",
++                m_opt_choice_str(pl_csp_trc_names, trc));
++        return true;
++    }
++
++    int ow = p->params.w, oh = p->params.h;
++    if (o->downscale > 0 && p->params.h > o->downscale) {
++        oh = o->downscale & ~1;
++        ow = (int)lrint((double)p->params.w * oh / p->params.h / 2) * 2;
++        struct mp_rect *c = &p->out_params.crop;
++        c->x0 = c->x0 * ow / p->params.w; c->x1 = c->x1 * ow / p->params.w;
++        c->y0 = c->y0 * oh / p->params.h; c->y1 = c->y1 * oh / p->params.h;
++    }
++    p->out_params.w = ow;
++    p->out_params.h = oh;
++
++    float peak = o->peak > 0 ? o->peak : p->params.color.hdr.max_luma;
++    struct nrh_desc d = {
++        .abi = NRH_ABI,
++        .cu_context = p->cuda_ctx,
++        .cu_stream = p->stream,
++        .in_w = p->params.w, .in_h = p->params.h,
++        .fmt = fmt,
++        .out_w = ow, .out_h = oh,
++        .matrix = ntrc == NRH_TRC_PQ ? NRH_MAT_2020 : map_matrix(&p->params),
++        .range = p->params.repr.levels == PL_COLOR_LEVELS_FULL ? NRH_RANGE_FULL
++                                                               : NRH_RANGE_LIMITED,
++        .trc = ntrc,
++        .peak_nits = peak > 0 ? peak : 1000,
++        .log = host_log,
++        .log_opaque = vf,
++    };
++    update_params(vf);
++    if (p->api.create(&d, &p->np, &p->nrh) != 0) {
++        char *why = talloc_asprintf(vf, "host refused the stream: %s", p->api.error(NULL));
++        go_off(vf, why);
++        talloc_free(why);
++        return true;
++    }
++    p->active = true;
++    p->fails = 0;
++    p->reset_next = true;
++    MP_VERBOSE(vf, "%dx%d %s %s -> %dx%d, queue depth %d\n", p->params.w, p->params.h,
++               fmt == NRH_P010 ? "p010" : "nv12", ntrc == NRH_TRC_PQ ? "PQ" : "SDR",
++               ow, oh, MPCLAMP(o->queue_depth, 1, MAX_DEPTH - 1));
++    return true;
++}
++
++static struct mp_image *alloc_out(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    if (!mp_update_av_hw_frames_pool(&p->hw_pool, p->av_device_ref, IMGFMT_CUDA,
++                                     p->out_params.hw_subfmt, p->out_params.w,
++                                     p->out_params.h, false))
++    {
++        MP_ERR(vf, "Failed to create hw pool\n");
++        return NULL;
++    }
++    AVFrame *av_frame = av_frame_alloc();
++    MP_HANDLE_OOM(av_frame);
++    if (av_hwframe_get_buffer(p->hw_pool, av_frame, 0) < 0) {
++        MP_ERR(vf, "Failed to allocate frame from hw pool\n");
++        av_frame_free(&av_frame);
++        return NULL;
++    }
++    struct mp_image *img = mp_image_from_av_frame(av_frame);
++    av_frame_free(&av_frame);
++    return img;
++}
++
++// Enqueue `in` without waiting; it stays alive through the refqueue until
++// its emission waits the completion event.
++static bool submit_frame(struct mp_filter *vf, struct mp_image *in)
++{
++    struct priv *p = vf->priv;
++    mp_assert(p->ring_n < MAX_DEPTH);
++
++    struct mp_image *out = alloc_out(vf);
++    if (!out)
++        return false;
++    mp_image_copy_attributes(out, in);
++    out->params = p->out_params;
++    out->pts = in->pts;
++
++    CUcontext dummy;
++    if (CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) < 0) {
++        talloc_free(out);
++        return false;
++    }
++    bool ok = order_after_decode(vf);
++    if (ok) {
++        struct nrh_params np = p->np;
++        if (p->reset_next)
++            np.reset = NRH_RESET_ONCE;
++        const struct nrh_frame fin = {
++            .plane = {(uintptr_t)in->planes[0], (uintptr_t)in->planes[1]},
++            .pitch = {in->stride[0], in->stride[1]},
++        };
++        const struct nrh_frame fout = {
++            .plane = {(uintptr_t)out->planes[0], (uintptr_t)out->planes[1]},
++            .pitch = {out->stride[0], out->stride[1]},
++        };
++        ok = p->api.process(p->nrh, &fin, &fout, &np) == 0;
++        if (!ok)
++            MP_ERR(vf, "processing failed: %s\n", p->api.error(p->nrh));
++        else
++            p->reset_next = false;
++    }
++    CUevent done = p->done_evt[p->done_evt_next];
++    p->done_evt_next = (p->done_evt_next + 1) % MAX_DEPTH;
++    // recorded even on failure: work already queued may reference `out`
++    bool rec = CHECK_CU(p->cu->cuEventRecord(done, p->stream)) >= 0;
++    if (!ok || !rec) {
++        p->cu->cuStreamSynchronize(p->stream);
++        p->cu->cuCtxPopCurrent(&dummy);
++        talloc_free(out);
++        if (++p->fails >= MAX_FAILS)
++            go_off(vf, "repeated processing failures");
++        return false;
++    }
++    p->cu->cuCtxPopCurrent(&dummy);
++    p->fails = 0;
++
++    p->ring[p->ring_n].src = in;
++    p->ring[p->ring_n].out = out;
++    p->ring[p->ring_n].done = done;
++    p->ring_n++;
++    return true;
++}
++
++static struct mp_image *pop_ring(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    mp_assert(p->ring_n > 0);
++    struct mp_image *out = p->ring[0].out;
++    CUevent done = p->ring[0].done;
++    p->ring_n--;
++    memmove(&p->ring[0], &p->ring[1], p->ring_n * sizeof(p->ring[0]));
++
++    CUcontext dummy;
++    bool ok = CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) >= 0;
++    if (ok) {
++        ok = CHECK_CU(p->cu->cuEventSynchronize(done)) >= 0;
++        p->cu->cuCtxPopCurrent(&dummy);
++    }
++    if (!ok) {
++        talloc_free(out);
++        return NULL;
++    }
++    return out;
++}
++
++static void vf_dlssnr_process(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++
++    struct mp_image *in_fmt = mp_refqueue_execute_reinit(p->queue);
++    if (in_fmt) {
++        release_device_state(vf);
++        if (!configure(vf, in_fmt)) {
++            mp_filter_internal_mark_failed(vf);
++            return;
++        }
++        p->depth = p->active ? MPCLAMP(p->opts->queue_depth, 1, MAX_DEPTH - 1) : 1;
++        mp_refqueue_set_refs(p->queue, 0, p->depth - 1);
++    }
++
++    if (!mp_refqueue_can_output(p->queue))
++        return;
++
++    struct mp_image *cur = mp_refqueue_get(p->queue, 0);
++    if (!cur)
++        return;
++
++    if (!p->active || !p->enabled) {
++        clear_ring(vf);
++        mp_refqueue_write_out_pin(p->queue, mp_image_new_ref(cur));
++        return;
++    }
++
++    // Submit the current frame and the buffered future frames before waiting
++    // on the oldest, so the GPU works ahead.
++    for (int rel = p->ring_n; p->active && p->ring_n < p->depth; rel++) {
++        struct mp_image *src = mp_refqueue_get(p->queue, rel);
++        if (!src || !submit_frame(vf, src))
++            break;
++    }
++
++    struct mp_image *out = NULL;
++    if (p->ring_n && p->ring[0].src == cur) {
++        out = pop_ring(vf);
++    } else if (p->ring_n) {
++        MP_WARN(vf, "pipeline lost sync; resubmitting\n");
++        clear_ring(vf);
++        if (p->active && submit_frame(vf, cur))
++            out = pop_ring(vf);
++    }
++    if (!out) {
++        // the frame could not be processed: show it unchanged rather than
++        // stalling (go_off() decides when to stop trying)
++        out = mp_image_new_ref(cur);
++    }
++    mp_refqueue_write_out_pin(p->queue, out);
++}
++
++static bool parse_float(const char *s, float *out)
++{
++    char *end = NULL;
++    double v = strtod(s, &end);
++    if (!end || end == s || *end)
++        return false;
++    *out = v;
++    return true;
++}
++
++static bool vf_dlssnr_command(struct mp_filter *vf, struct mp_filter_command *cmd)
++{
++    struct priv *p = vf->priv;
++    struct opts *o = p->opts;
++    if (cmd->type != MP_FILTER_COMMAND_TEXT || !cmd->cmd || !cmd->arg)
++        return false;
++    const char *c = cmd->cmd, *a = cmd->arg;
++    float v;
++    if (!strcmp(c, "enable")) {
++        p->enabled = strcmp(a, "0") && strcmp(a, "no");
++    } else if (!strcmp(c, "hl")) {
++        if (strcmp(a, "keep") && strcmp(a, "shape"))
++            return false;
++        o->hl = !strcmp(a, "shape");
++    } else if (!strcmp(c, "reset")) {
++        if (!strcmp(a, "every")) o->reset = RESET_EVERY;
++        else if (!strcmp(a, "seek")) o->reset = RESET_SEEK;
++        else if (!strcmp(a, "never")) o->reset = RESET_NEVER;
++        else return false;
++        p->reset_next = true;
++    } else if (!strcmp(c, "identity")) {
++        o->identity = strcmp(a, "0") && strcmp(a, "no");
++    } else if (parse_float(a, &v)) {
++        if (!strcmp(c, "intensity")) o->intensity = MPCLAMP(v, 0, 1);
++        else if (!strcmp(c, "structure")) o->structure = v;
++        else if (!strcmp(c, "tone")) o->tone = v;
++        else if (!strcmp(c, "skin")) o->skin = v;
++        else if (!strcmp(c, "shadow")) o->shadow = MPCLAMP(v, 0, 1);
++        else return false;
++    } else {
++        return false;
++    }
++    update_params(vf);
++    mp_filter_wakeup(vf);
++    return true;
++}
++
++static void uninit(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    flush_frames(vf);
++    release_device_state(vf);
++    talloc_free(p->queue);
++    if (p->api.handle)
++        lib_close(p->api.handle);
++    if (p->cu)
++        cuda_free_functions(&p->cu);
++}
++
++static const struct mp_filter_info vf_dlssnr_filter = {
++    .name = "dlssnr",
++    .process = vf_dlssnr_process,
++    .command = vf_dlssnr_command,
++    .reset = flush_frames,
++    .destroy = uninit,
++    .priv_size = sizeof(struct priv),
++};
++
++// During hr-seek, frames before the target are discarded after the filter:
++// skip the network on them.
++static bool drop_pre_seek_target(void *ctx, struct mp_image *mpi)
++{
++    struct mp_filter *vf = ctx;
++    struct priv *p = vf->priv;
++    if (!p->opts->skip_seek_pre_target || mpi->pts == MP_NOPTS_VALUE)
++        return false;
++    struct mp_stream_info *info = mp_filter_find_stream_info(vf);
++    double target;
++    if (!(info && info->get_hrseek && info->get_hrseek(info, &target)))
++        return false;
++    return mpi->pts < target - 0.005;
++}
++
++static struct mp_filter *vf_dlssnr_create(struct mp_filter *parent, void *options)
++{
++    struct mp_filter *f = mp_filter_create(parent, &vf_dlssnr_filter);
++    if (!f) {
++        talloc_free(options);
++        return NULL;
++    }
++    mp_filter_add_pin(f, MP_PIN_IN, "in");
++    mp_filter_add_pin(f, MP_PIN_OUT, "out");
++
++    struct priv *p = f->priv;
++    p->opts = talloc_steal(p, options);
++    p->queue = mp_refqueue_alloc(f);
++    p->enabled = p->opts->enable;
++
++    if (cuda_load_functions(&p->cu, NULL) < 0) {
++        p->cu = NULL;
++        go_off(f, "CUDA driver API unavailable");
++    }
++
++    const char *lib = p->opts->host && p->opts->host[0] ? p->opts->host : NRH_DEFAULT_LIB;
++    p->host_path = mp_normalize_user_path(p, f->global, lib);
++    if (p->cu) {
++        p->api.handle = lib_open(p->host_path);
++        if (!p->api.handle) {
++            char *why = talloc_asprintf(p, "relight host '%s' not loaded", p->host_path);
++            go_off(f, why);
++        } else {
++            p->api.abi = lib_sym(p->api.handle, "nrh_abi");
++            p->api.create = lib_sym(p->api.handle, "nrh_create");
++            p->api.process = lib_sym(p->api.handle, "nrh_process");
++            p->api.error = lib_sym(p->api.handle, "nrh_error");
++            p->api.destroy = lib_sym(p->api.handle, "nrh_destroy");
++            if (!p->api.abi || !p->api.create || !p->api.process || !p->api.error ||
++                !p->api.destroy || p->api.abi() != NRH_ABI)
++            {
++                lib_close(p->api.handle);
++                memset(&p->api, 0, sizeof(p->api));
++                go_off(f, "relight host has a different ABI");
++            } else {
++                MP_VERBOSE(f, "Loaded relight host: %s\n", p->host_path);
++            }
++        }
++    }
++
++    mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_NV12));
++    mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_P010));
++    mp_refqueue_set_refs(p->queue, 0, 0);
++    mp_refqueue_set_mode(p->queue, 0);
++    mp_refqueue_set_drop_check(p->queue, drop_pre_seek_target, f);
++    return f;
++}
++
++#define OPT_BASE_STRUCT struct opts
++static const m_option_t vf_opts_fields[] = {
++    {"host", OPT_STRING(host), .flags = M_OPT_FILE},
++    {"enable", OPT_BOOL(enable)},
++    {"intensity", OPT_FLOAT(intensity), M_RANGE(0, 1)},
++    {"structure", OPT_FLOAT(structure)},
++    {"tone", OPT_FLOAT(tone)},
++    {"skin", OPT_FLOAT(skin)},
++    {"style", OPT_INT(style), M_RANGE(0, 2)},
++    {"auto-mask", OPT_BOOL(auto_mask)},
++    {"reset", OPT_CHOICE(reset, {"every", RESET_EVERY}, {"seek", RESET_SEEK},
++                                {"never", RESET_NEVER})},
++    {"hdr", OPT_CHOICE(hdr, {"auto", 0}, {"off", 1})},
++    {"hl", OPT_CHOICE(hl, {"keep", 0}, {"shape", 1})},
++    {"shadow", OPT_FLOAT(shadow), M_RANGE(0, 1)},
++    {"peak", OPT_FLOAT(peak), M_RANGE(0, 10000)},
++    {"downscale", OPT_INT(downscale), M_RANGE(0, 4320)},
++    {"identity", OPT_BOOL(identity)},
++    {"queue-depth", OPT_INT(queue_depth), M_RANGE(1, MAX_DEPTH - 1)},
++    {"skip-seek-pre-target", OPT_BOOL(skip_seek_pre_target)},
++    {0}
++};
++
++const struct mp_user_filter_entry vf_dlssnr = {
++    .desc = {
++        .description = "GPU-resident neural relight through a host library (CUDA)",
++        .name = "dlssnr",
++        .priv_size = sizeof(OPT_BASE_STRUCT),
++        .priv_defaults = &(const OPT_BASE_STRUCT) {
++            .enable = true,
++            .intensity = 1,
++            .structure = 1,
++            .tone = 1,
++            .skin = -1,
++            .auto_mask = true,
++            .reset = RESET_EVERY,
++            .shadow = 0.10,
++            .peak = 1000,
++            .queue_depth = 3,
++            .skip_seek_pre_target = true,
++        },
++        .options = vf_opts_fields,
++    },
++    .create = vf_dlssnr_create,
++};
+-- 
+2.54.0.windows.1
+
