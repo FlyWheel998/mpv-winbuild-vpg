@@ -1,4 +1,4 @@
-From bd7571783ae918033d40b23d91d6bd2a8e095995 Mon Sep 17 00:00:00 2001
+From ee3271034f58bdbf1feb5358704d63493143c9f4 Mon Sep 17 00:00:00 2001
 From: VideoPlayerGold snapshot <jestar001@gmail.com>
 Date: Sun, 4 Oct 2026 21:37:22 -0400
 Subject: [PATCH] vf_dlssnr: GPU-resident neural relight filter through a
@@ -12,9 +12,9 @@ loaded at runtime across the C ABI in nrhost.h.
  filters/user_filters.c   |   1 +
  filters/user_filters.h   |   1 +
  meson.build              |   1 +
- video/filter/nrhost.h    |  87 +++++
- video/filter/vf_dlssnr.c | 780 +++++++++++++++++++++++++++++++++++++++
- 5 files changed, 870 insertions(+)
+ video/filter/nrhost.h    |  88 +++++
+ video/filter/vf_dlssnr.c | 791 +++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 882 insertions(+)
  create mode 100644 video/filter/nrhost.h
  create mode 100644 video/filter/vf_dlssnr.c
 
@@ -56,10 +56,10 @@ index 5d140ee9a5..9785411de6 100644
      if win32
 diff --git a/video/filter/nrhost.h b/video/filter/nrhost.h
 new file mode 100644
-index 0000000000..2f0ff33241
+index 0000000000..4341e3bed4
 --- /dev/null
 +++ b/video/filter/nrhost.h
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,88 @@
 +/*
 + * nrhost.h - C ABI between mpv's vf_dlssnr and a neural-relight host DLL.
 + *
@@ -80,7 +80,7 @@ index 0000000000..2f0ff33241
 +extern "C" {
 +#endif
 +
-+#define NRH_ABI 1
++#define NRH_ABI 2
 +
 +enum nrh_fmt   { NRH_NV12 = 1, NRH_P010 = 2 };
 +enum nrh_mat   { NRH_MAT_601 = 1, NRH_MAT_709 = 2, NRH_MAT_2020 = 3 };
@@ -114,6 +114,7 @@ index 0000000000..2f0ff33241
 +    int hl_keep;                    // PQ: 1 = keep the source's highlights, 0 = network shapes them
 +    float shadow_guard;             // PQ: max gain change below 1 % luminance (0.10)
 +    int identity;                   // 1 = conversions only, no network (plumbing test)
++    int keep_colour;                // SDR: 1 = network luma + the source's own chroma (PQ always keeps chroma)
 +};
 +
 +struct nrh_frame {
@@ -149,10 +150,10 @@ index 0000000000..2f0ff33241
 +#endif
 diff --git a/video/filter/vf_dlssnr.c b/video/filter/vf_dlssnr.c
 new file mode 100644
-index 0000000000..df5557959c
+index 0000000000..d039121cb6
 --- /dev/null
 +++ b/video/filter/vf_dlssnr.c
-@@ -0,0 +1,780 @@
+@@ -0,0 +1,791 @@
 +/*
 + * vf_dlssnr: GPU-resident neural relight filter (CUDA)
 + *
@@ -166,8 +167,12 @@ index 0000000000..df5557959c
 + * Fail-open: a missing host, a host that refuses the stream, or repeated
 + * processing failures play the original picture with one warning.
 + *
++ * colour=keep (default) takes only the network's luma and keeps the source's
++ * chroma, as the PQ path always does: the network otherwise drains skin
++ * colour. colour=model passes its full colour output.
++ *
 + * Runtime: `vf-command <label> <intensity|structure|tone|skin|shadow|hl|
-+ * reset|identity|enable> <value>`.
++ * colour|reset|identity|enable> <value>`.
 + *
 + * This file is part of mpv.
 + *
@@ -234,6 +239,7 @@ index 0000000000..df5557959c
 +    int reset;
 +    int hdr;            // 0 auto, 1 off
 +    int hl;             // 0 keep, 1 shape
++    int colour;         // 0 keep, 1 model
 +    int downscale;
 +    bool identity;
 +    int queue_depth;
@@ -368,6 +374,7 @@ index 0000000000..df5557959c
 +        .hl_keep = o->hl == 0,
 +        .shadow_guard = o->shadow,
 +        .identity = o->identity,
++        .keep_colour = o->colour == 0,
 +    };
 +}
 +
@@ -776,6 +783,10 @@ index 0000000000..df5557959c
 +        if (strcmp(a, "keep") && strcmp(a, "shape"))
 +            return false;
 +        o->hl = !strcmp(a, "shape");
++    } else if (!strcmp(c, "colour")) {
++        if (strcmp(a, "keep") && strcmp(a, "model"))
++            return false;
++        o->colour = !strcmp(a, "model");
 +    } else if (!strcmp(c, "reset")) {
 +        if (!strcmp(a, "every")) o->reset = RESET_EVERY;
 +        else if (!strcmp(a, "seek")) o->reset = RESET_SEEK;
@@ -902,6 +913,7 @@ index 0000000000..df5557959c
 +                                {"never", RESET_NEVER})},
 +    {"hdr", OPT_CHOICE(hdr, {"auto", 0}, {"off", 1})},
 +    {"hl", OPT_CHOICE(hl, {"keep", 0}, {"shape", 1})},
++    {"colour", OPT_CHOICE(colour, {"keep", 0}, {"model", 1})},
 +    {"shadow", OPT_FLOAT(shadow), M_RANGE(0, 1)},
 +    {"peak", OPT_FLOAT(peak), M_RANGE(0, 10000)},
 +    {"downscale", OPT_INT(downscale), M_RANGE(0, 4320)},
