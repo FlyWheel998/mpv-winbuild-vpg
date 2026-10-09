@@ -1,4 +1,4 @@
-From 3e1b8192c20362114e42b318c92666ad5f4a71c8 Mon Sep 17 00:00:00 2001
+From 5d7b8df3acc3898d22f955ba89abec5ec98d3024 Mon Sep 17 00:00:00 2001
 From: VideoPlayerGold snapshot <jestar001@gmail.com>
 Date: Fri, 9 Oct 2026 11:45:05 -0400
 Subject: [PATCH] vf_vsrhost: GPU-resident video super-resolution through a
@@ -14,9 +14,9 @@ the C ABI in vsrhost.h.
  filters/user_filters.c    |   1 +
  filters/user_filters.h    |   1 +
  meson.build               |   1 +
- video/filter/vf_vsrhost.c | 801 ++++++++++++++++++++++++++++++++++++++
+ video/filter/vf_vsrhost.c | 815 ++++++++++++++++++++++++++++++++++++++
  video/filter/vsrhost.h    | 104 +++++
- 5 files changed, 908 insertions(+)
+ 5 files changed, 922 insertions(+)
  create mode 100644 video/filter/vf_vsrhost.c
  create mode 100644 video/filter/vsrhost.h
 
@@ -58,10 +58,10 @@ index 9785411de6..436fde324e 100644
      if win32
 diff --git a/video/filter/vf_vsrhost.c b/video/filter/vf_vsrhost.c
 new file mode 100644
-index 0000000000..0a2c3e5225
+index 0000000000..fcedf2aec2
 --- /dev/null
 +++ b/video/filter/vf_vsrhost.c
-@@ -0,0 +1,801 @@
+@@ -0,0 +1,815 @@
 +/*
 + * vf_vsrhost: GPU-resident video super-resolution through a host library (CUDA)
 + *
@@ -75,6 +75,9 @@ index 0000000000..0a2c3e5225
 + * of output demand (as vf_vapoursynth does), each input surface is released
 + * as soon as the host has copied it, and output pts come from the input
 + * frame with the same serial.
++ *
++ * Input: anything decodable is converted to CUDA nv12 in front (autoconvert, as refqueue does), so
++ * 10-bit and software-decoded SD sources work too.
 + *
 + * Fail-open: a missing host, a host that refuses the stream (HD, HDR, odd
 + * aspect, missing engines) or a push failure plays the original picture with
@@ -115,6 +118,7 @@ index 0000000000..0a2c3e5225
 +#include <libavutil/pixfmt.h>
 +
 +#include "common/common.h"
++#include "filters/f_autoconvert.h"
 +#include "filters/filter.h"
 +#include "filters/filter_internal.h"
 +#include "filters/user_filters.h"
@@ -156,6 +160,8 @@ index 0000000000..0a2c3e5225
 +
 +struct priv {
 +    struct opts *opts;
++    struct mp_autoconvert *conv;   // anything decodable -> CUDA nv12 (10-bit / software-decoded sources)
++    struct mp_pin *in_pin;
 +    char *host_path;
 +    struct host_api api;
 +    struct vsh *vsh;
@@ -607,7 +613,7 @@ index 0000000000..0a2c3e5225
 +static void vf_vsrhost_process(struct mp_filter *vf)
 +{
 +    struct priv *p = vf->priv;
-+    struct mp_pin *in = vf->ppins[0], *outp = vf->ppins[1];
++    struct mp_pin *in = p->in_pin, *outp = vf->ppins[1];
 +
 +    release_inputs(vf, false);
 +
@@ -802,6 +808,14 @@ index 0000000000..0a2c3e5225
 +    struct priv *p = f->priv;
 +    p->opts = talloc_steal(p, options);
 +    p->enabled = p->opts->enable;
++
++    // Frames the hardware decoder cannot produce (10-bit H.264, software decode) are converted to 8-bit
++    // nv12 and uploaded to the player's CUDA device here, as vf_dlssnr's refqueue does.
++    p->conv = mp_autoconvert_create(f);
++    MP_HANDLE_OOM(p->conv);
++    mp_autoconvert_add_imgfmt(p->conv, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_NV12));
++    mp_pin_connect(p->conv->f->pins[0], f->ppins[0]);
++    p->in_pin = p->conv->f->pins[1];
 +
 +    if (cuda_load_functions(&p->cu, NULL) < 0) {
 +        p->cu = NULL;
