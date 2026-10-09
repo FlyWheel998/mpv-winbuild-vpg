@@ -1,0 +1,978 @@
+From 3e1b8192c20362114e42b318c92666ad5f4a71c8 Mon Sep 17 00:00:00 2001
+From: VideoPlayerGold snapshot <jestar001@gmail.com>
+Date: Fri, 9 Oct 2026 11:45:05 -0400
+Subject: [PATCH] vf_vsrhost: GPU-resident video super-resolution through a
+ runtime host library
+
+Push/pull plumbing for multi-frame super-resolution hosts: CUDA nv12 in, a
+larger CUDA nv12 frame out (BT.709) from an own pool, input read ahead of
+output demand and released once the host has copied it, output pts taken
+from the input frame with the same serial, EOF drained, reset on seek,
+fail-open. The network lives in a host library loaded at runtime across
+the C ABI in vsrhost.h.
+---
+ filters/user_filters.c    |   1 +
+ filters/user_filters.h    |   1 +
+ meson.build               |   1 +
+ video/filter/vf_vsrhost.c | 801 ++++++++++++++++++++++++++++++++++++++
+ video/filter/vsrhost.h    | 104 +++++
+ 5 files changed, 908 insertions(+)
+ create mode 100644 video/filter/vf_vsrhost.c
+ create mode 100644 video/filter/vsrhost.h
+
+diff --git a/filters/user_filters.c b/filters/user_filters.c
+index 122412b277..21b98a122e 100644
+--- a/filters/user_filters.c
++++ b/filters/user_filters.c
+@@ -104,6 +104,7 @@ const struct mp_user_filter_entry *vf_list[] = {
+ #if HAVE_CUDA_HWACCEL
+     &vf_animejanai,
+     &vf_dlssnr,
++    &vf_vsrhost,
+ #endif
+ #if HAVE_AMF
+     &vf_amf_frc,
+diff --git a/filters/user_filters.h b/filters/user_filters.h
+index eb0f71bdf5..11acefbe0d 100644
+--- a/filters/user_filters.h
++++ b/filters/user_filters.h
+@@ -38,6 +38,7 @@ extern const struct mp_user_filter_entry vf_vavpp;
+ extern const struct mp_user_filter_entry vf_d3d11vpp;
+ extern const struct mp_user_filter_entry vf_animejanai;
+ extern const struct mp_user_filter_entry vf_dlssnr;
++extern const struct mp_user_filter_entry vf_vsrhost;
+ extern const struct mp_user_filter_entry vf_amf_frc;
+ extern const struct mp_user_filter_entry vf_fingerprint;
+ extern const struct mp_user_filter_entry vf_gpu;
+diff --git a/meson.build b/meson.build
+index 9785411de6..436fde324e 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1403,6 +1403,7 @@ features += {'cuda-hwaccel': cuda_hwaccel.allowed()}
+ if features['cuda-hwaccel']
+     sources += files('video/filter/vf_animejanai.c',
+                      'video/filter/vf_dlssnr.c',
++                     'video/filter/vf_vsrhost.c',
+                      'video/out/hwdec/hwdec_cuda.c',
+                      'video/filter/vf_cudapass.c')
+     if win32
+diff --git a/video/filter/vf_vsrhost.c b/video/filter/vf_vsrhost.c
+new file mode 100644
+index 0000000000..0a2c3e5225
+--- /dev/null
++++ b/video/filter/vf_vsrhost.c
+@@ -0,0 +1,801 @@
++/*
++ * vf_vsrhost: GPU-resident video super-resolution through a host library (CUDA)
++ *
++ * Plumbing only: CUDA nv12 frames in, a larger CUDA nv12 frame out (BT.709),
++ * frames never leave GPU memory. The network, its colour conversion and its
++ * multi-frame latency live in a host library loaded at runtime across the C
++ * ABI in vsrhost.h, so no vendor SDK links into mpv.
++ *
++ * Unlike vf_dlssnr this filter is push/pull: the host holds a chunk of input
++ * frames (about 28) before the first output appears, so input is read ahead
++ * of output demand (as vf_vapoursynth does), each input surface is released
++ * as soon as the host has copied it, and output pts come from the input
++ * frame with the same serial.
++ *
++ * Fail-open: a missing host, a host that refuses the stream (HD, HDR, odd
++ * aspect, missing engines) or a push failure plays the original picture with
++ * one warning.
++ *
++ * Runtime: `vf-command <label> enable <yes|no>`.
++ *
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <stdio.h>
++
++#include "config.h"
++
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <dlfcn.h>
++#endif
++
++#include <ffnvcodec/dynlink_loader.h>
++
++#include <libavutil/hwcontext.h>
++#include <libavutil/hwcontext_cuda.h>
++#include <libavutil/pixfmt.h>
++
++#include "common/common.h"
++#include "filters/filter.h"
++#include "filters/filter_internal.h"
++#include "filters/user_filters.h"
++#include "options/m_option.h"
++#include "options/path.h"
++#include "video/fmt-conversion.h"
++#include "video/mp_image.h"
++#include "video/mp_image_pool.h"
++
++#include "vsrhost.h"
++
++#ifdef _WIN32
++#define VSH_DEFAULT_LIB "~~/../swiftvr/vpg_swiftvr_host.dll"
++#else
++#define VSH_DEFAULT_LIB "libvsrhost.so"
++#endif
++
++#define MAX_PENDING_IN 8      // input surfaces waiting for the host's copy to finish
++#define MAX_SERIALS 256       // frames inside the host (lookahead + chunks in flight)
++
++struct opts {
++    char *host;
++    bool enable;
++    bool identity;
++    bool skip_seek_pre_target;
++};
++
++struct host_api {
++    void *handle;
++    vsh_abi_fn abi;
++    vsh_create_fn create;
++    vsh_push_fn push;
++    vsh_simple_fn flush, reset, ready;
++    vsh_pull_fn pull;
++    vsh_stats_fn stats;
++    vsh_error_fn error;
++    vsh_destroy_fn destroy;
++};
++
++struct priv {
++    struct opts *opts;
++    char *host_path;
++    struct host_api api;
++    struct vsh *vsh;
++
++    CudaFunctions *cu;
++    AVBufferRef *av_device_ref;
++    CUcontext cuda_ctx;
++    CUstream stream;            // ours, handed to the host for push/pull conversions
++    CUstream decode_stream;     // the decoder's, may be NULL (legacy default stream)
++    CUevent decode_evt;
++
++    AVBufferRef *hw_pool;
++    struct mp_image_params in_params, out_params;
++    bool have_params;
++
++    bool active;                // host created for the current stream
++    bool off;                   // failed open for this filter instance (one warning given)
++    bool enabled;               // runtime enable (vf-command)
++    bool flushed;               // EOF or format change: vsh_flush called, draining
++    bool reinit_after_drain;    // format change: recreate the host once drained
++    bool first_out_logged;
++    int64_t next_serial;
++
++    struct {                    // inputs whose copy into the host may still be running
++        struct mp_image *img;
++        CUevent done;
++    } pend[MAX_PENDING_IN];
++    int pend_n;
++    CUevent pend_evt[MAX_PENDING_IN];
++    int pend_evt_next;
++    CUevent pull_evt;
++
++    struct mp_image *meta[MAX_SERIALS];   // metadata-only refs, serial % MAX_SERIALS
++    int64_t meta_lo, meta_hi;             // serials [lo, hi) are inside the host
++};
++
++static void *lib_open(const char *path)
++{
++#ifdef _WIN32
++    if (strpbrk(path, "/\\")) {
++        char full[MAX_PATH];
++        DWORD n = GetFullPathNameA(path, sizeof(full), full, NULL);
++        const char *p = (n > 0 && n < sizeof(full)) ? full : path;
++        return (void *)LoadLibraryExA(p, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
++                                               LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
++    }
++    return (void *)LoadLibraryA(path);
++#else
++    return dlopen(path, RTLD_NOW | RTLD_LOCAL);
++#endif
++}
++
++static void *lib_sym(void *handle, const char *name)
++{
++#ifdef _WIN32
++    return (void *)GetProcAddress((HMODULE)handle, name);
++#else
++    return dlsym(handle, name);
++#endif
++}
++
++static void lib_close(void *handle)
++{
++#ifdef _WIN32
++    FreeLibrary((HMODULE)handle);
++#else
++    dlclose(handle);
++#endif
++}
++
++static int check_cu(struct mp_filter *vf, CUresult err, const char *func)
++{
++    struct priv *p = vf->priv;
++    if (err == CUDA_SUCCESS)
++        return 0;
++    const char *err_name = NULL;
++    p->cu->cuGetErrorName(err, &err_name);
++    MP_ERR(vf, "%s failed: %s\n", func, err_name ? err_name : "unknown");
++    return -1;
++}
++
++#define CHECK_CU(x) check_cu(vf, (x), #x)
++
++static void host_log(void *opaque, int level, const char *msg)
++{
++    struct mp_filter *vf = opaque;
++    int l = level <= VSH_LOG_ERROR ? MSGL_ERR : level == VSH_LOG_WARN ? MSGL_WARN :
++            level == VSH_LOG_INFO ? MSGL_INFO : MSGL_DEBUG;
++    mp_msg(vf->log, l, "[host] %s\n", msg);
++}
++
++// Called from the host's worker thread.
++static void host_wakeup(void *opaque)
++{
++    mp_filter_wakeup(opaque);
++}
++
++// Fail open: from here on this filter instance passes frames through.
++static void go_off(struct mp_filter *vf, const char *why)
++{
++    struct priv *p = vf->priv;
++    if (!p->off)
++        MP_WARN(vf, "%s - playing the original picture\n", why);
++    p->off = true;
++    p->active = false;
++}
++
++static bool ctx_push(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    return p->cu && p->cuda_ctx && CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) >= 0;
++}
++
++static void ctx_pop(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    CUcontext dummy;
++    p->cu->cuCtxPopCurrent(&dummy);
++}
++
++// Release input surfaces the host has finished copying. `wait` blocks on the
++// oldest (only used when the small pending ring is full, or on teardown).
++static void release_inputs(struct mp_filter *vf, bool wait_all)
++{
++    struct priv *p = vf->priv;
++    if (!p->pend_n)
++        return;
++    if (!ctx_push(vf)) {
++        for (int i = 0; i < p->pend_n; i++)
++            mp_image_unrefp(&p->pend[i].img);
++        p->pend_n = 0;
++        return;
++    }
++    int n = 0;
++    while (n < p->pend_n) {
++        CUresult r = wait_all ? p->cu->cuEventSynchronize(p->pend[n].done)
++                              : p->cu->cuEventQuery(p->pend[n].done);
++        if (r == CUDA_ERROR_NOT_READY)
++            break;
++        mp_image_unrefp(&p->pend[n].img);
++        n++;
++    }
++    ctx_pop(vf);
++    p->pend_n -= n;
++    memmove(&p->pend[0], &p->pend[n], p->pend_n * sizeof(p->pend[0]));
++}
++
++static void clear_meta(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    for (int i = 0; i < MAX_SERIALS; i++)
++        mp_image_unrefp(&p->meta[i]);
++    p->meta_lo = p->meta_hi = p->next_serial;
++}
++
++static void destroy_host(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    release_inputs(vf, true);
++    if (p->vsh)
++        p->api.destroy(&p->vsh);
++    clear_meta(vf);
++    p->active = false;
++    p->flushed = false;
++    p->reinit_after_drain = false;
++}
++
++static void release_device_state(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    destroy_host(vf);
++    if (ctx_push(vf)) {
++        if (p->stream)
++            p->cu->cuStreamSynchronize(p->stream);
++        for (int i = 0; i < MAX_PENDING_IN; i++) {
++            if (p->pend_evt[i])
++                p->cu->cuEventDestroy(p->pend_evt[i]);
++            p->pend_evt[i] = NULL;
++        }
++        if (p->pull_evt)
++            p->cu->cuEventDestroy(p->pull_evt);
++        if (p->decode_evt)
++            p->cu->cuEventDestroy(p->decode_evt);
++        if (p->stream)
++            p->cu->cuStreamDestroy(p->stream);
++        ctx_pop(vf);
++    }
++    p->pull_evt = p->decode_evt = NULL;
++    p->stream = p->decode_stream = NULL;
++    av_buffer_unref(&p->hw_pool);
++    av_buffer_unref(&p->av_device_ref);
++    p->cuda_ctx = NULL;
++}
++
++static int map_matrix(const struct mp_image_params *params)
++{
++    switch (params->repr.sys) {
++    case PL_COLOR_SYSTEM_BT_709: return VSH_MAT_709;
++    case PL_COLOR_SYSTEM_BT_601: return VSH_MAT_601;
++    default:
++        return (params->w >= 1280 || params->h > 576) ? VSH_MAT_709 : VSH_MAT_601;
++    }
++}
++
++// Adopt the CUDA device of the incoming frames; make our own stream ordered
++// after decode, plus the events for input release and output completion.
++static bool adopt_device(struct mp_filter *vf, struct mp_image *in)
++{
++    struct priv *p = vf->priv;
++    if (!p->cu || !in->hwctx)
++        return false;
++    AVHWFramesContext *fctx = (void *)in->hwctx->data;
++    AVHWDeviceContext *avhwctx = fctx->device_ctx;
++    if (avhwctx->type != AV_HWDEVICE_TYPE_CUDA)
++        return false;
++    p->av_device_ref = av_buffer_ref(fctx->device_ref);
++    MP_HANDLE_OOM(p->av_device_ref);
++    AVCUDADeviceContext *cudactx = avhwctx->hwctx;
++    p->cuda_ctx = cudactx->cuda_ctx;
++    p->decode_stream = cudactx->stream;
++
++    if (!ctx_push(vf))
++        return false;
++    bool ok = CHECK_CU(p->cu->cuStreamCreate(&p->stream, CU_STREAM_NON_BLOCKING)) >= 0;
++    ok = ok && CHECK_CU(p->cu->cuEventCreate(&p->decode_evt, CU_EVENT_DISABLE_TIMING)) >= 0;
++    ok = ok && CHECK_CU(p->cu->cuEventCreate(&p->pull_evt, CU_EVENT_DISABLE_TIMING)) >= 0;
++    for (int i = 0; ok && i < MAX_PENDING_IN; i++)
++        ok = CHECK_CU(p->cu->cuEventCreate(&p->pend_evt[i], CU_EVENT_DISABLE_TIMING)) >= 0;
++    ctx_pop(vf);
++    return ok;
++}
++
++// Create the host for this stream. "Not for this stream" leaves p->active
++// false with one warning; nothing here is fatal for playback.
++static void configure(struct mp_filter *vf, struct mp_image *in)
++{
++    struct priv *p = vf->priv;
++    struct opts *o = p->opts;
++
++    p->in_params = in->params;
++    p->have_params = true;
++    p->active = false;
++    p->first_out_logged = false;
++
++    if (p->off || !p->api.handle || !p->enabled)
++        return;
++
++    if (!p->cuda_ctx && !adopt_device(vf, in)) {
++        go_off(vf, "input frames are not CUDA frames (needs hwdec=nvdec)");
++        return;
++    }
++
++    enum AVPixelFormat sw = imgfmt2pixfmt(in->params.hw_subfmt);
++    if (sw != AV_PIX_FMT_NV12) {
++        char *why = talloc_asprintf(vf, "unsupported surface format %s (8-bit nv12 only)",
++                                    mp_imgfmt_to_name(in->params.hw_subfmt));
++        go_off(vf, why);
++        talloc_free(why);
++        return;
++    }
++    if (pl_color_transfer_is_hdr(in->params.color.transfer)) {
++        go_off(vf, "HDR source");
++        return;
++    }
++
++    struct vsh_desc d = {
++        .abi = VSH_ABI,
++        .cu_context = p->cuda_ctx,
++        .cu_stream = p->stream,
++        .in_w = in->params.w, .in_h = in->params.h,
++        .fmt = VSH_NV12,
++        .matrix = map_matrix(&in->params),
++        .range = in->params.repr.levels == PL_COLOR_LEVELS_FULL ? VSH_RANGE_FULL
++                                                                : VSH_RANGE_LIMITED,
++        .par_num = in->params.p_w > 0 ? in->params.p_w : 1,
++        .par_den = in->params.p_h > 0 ? in->params.p_h : 1,
++        .log = host_log,
++        .log_opaque = vf,
++        .wakeup = host_wakeup,
++        .wakeup_opaque = vf,
++        .identity = o->identity,
++    };
++    if (p->api.create(&d, &p->vsh) != 0) {
++        char *why = talloc_asprintf(vf, "host refused the stream: %s", p->api.error(NULL));
++        go_off(vf, why);
++        talloc_free(why);
++        return;
++    }
++
++    p->out_params = in->params;
++    p->out_params.w = d.out_w;
++    p->out_params.h = d.out_h;
++    p->out_params.p_w = p->out_params.p_h = 1;
++    p->out_params.repr.sys = PL_COLOR_SYSTEM_BT_709;
++    p->out_params.repr.levels = PL_COLOR_LEVELS_LIMITED;
++    p->out_params.crop = (struct mp_rect){0, 0, d.out_w, d.out_h};
++    p->active = true;
++    p->flushed = false;
++    clear_meta(vf);
++    MP_INFO(vf, "%dx%d -> %dx%d, lookahead %d frames\n", in->params.w, in->params.h,
++            d.out_w, d.out_h, d.lookahead);
++}
++
++static struct mp_image *alloc_out(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    if (!mp_update_av_hw_frames_pool(&p->hw_pool, p->av_device_ref, IMGFMT_CUDA,
++                                     pixfmt2imgfmt(AV_PIX_FMT_NV12), p->out_params.w,
++                                     p->out_params.h, false))
++    {
++        MP_ERR(vf, "Failed to create hw pool\n");
++        return NULL;
++    }
++    AVFrame *av_frame = av_frame_alloc();
++    MP_HANDLE_OOM(av_frame);
++    if (av_hwframe_get_buffer(p->hw_pool, av_frame, 0) < 0) {
++        MP_ERR(vf, "Failed to allocate frame from hw pool\n");
++        av_frame_free(&av_frame);
++        return NULL;
++    }
++    struct mp_image *img = mp_image_from_av_frame(av_frame);
++    av_frame_free(&av_frame);
++    return img;
++}
++
++// Hand one input frame to the host. Returns VSH_OK, VSH_BUSY, or <0.
++static int push_frame(struct mp_filter *vf, struct mp_image *in)
++{
++    struct priv *p = vf->priv;
++    if (p->meta_hi - p->meta_lo >= MAX_SERIALS)
++        return VSH_BUSY;
++    if (p->pend_n == MAX_PENDING_IN)
++        release_inputs(vf, true);   // bounded: the copies are tiny and long queued
++
++    if (!ctx_push(vf))
++        return -1;
++    // The host reads the decoder surface on our stream: order it after decode.
++    if (p->decode_stream &&
++        (CHECK_CU(p->cu->cuEventRecord(p->decode_evt, p->decode_stream)) < 0 ||
++         CHECK_CU(p->cu->cuStreamWaitEvent(p->stream, p->decode_evt, 0)) < 0))
++    {
++        ctx_pop(vf);
++        return -1;
++    }
++    const struct vsh_frame fin = {
++        .plane = {(uintptr_t)in->planes[0], (uintptr_t)in->planes[1]},
++        .pitch = {in->stride[0], in->stride[1]},
++    };
++    int64_t serial = p->next_serial;
++    int rc = p->api.push(p->vsh, &fin, serial);
++    if (rc != VSH_OK) {
++        ctx_pop(vf);
++        return rc;
++    }
++    CUevent done = p->pend_evt[p->pend_evt_next];
++    p->pend_evt_next = (p->pend_evt_next + 1) % MAX_PENDING_IN;
++    bool rec = CHECK_CU(p->cu->cuEventRecord(done, p->stream)) >= 0;
++    if (!rec)
++        p->cu->cuStreamSynchronize(p->stream);
++    ctx_pop(vf);
++
++    p->meta[serial % MAX_SERIALS] = mp_image_new_dummy_ref(in);
++    p->meta_hi = ++p->next_serial;
++    if (rec) {
++        p->pend[p->pend_n].img = in;
++        p->pend[p->pend_n].done = done;
++        p->pend_n++;
++    } else {
++        talloc_free(in);
++    }
++    return VSH_OK;
++}
++
++// Pull one finished frame from the host. NULL if none is ready or on error.
++static struct mp_image *pull_frame(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    struct mp_image *out = alloc_out(vf);
++    if (!out)
++        return NULL;
++    if (!ctx_push(vf)) {
++        talloc_free(out);
++        return NULL;
++    }
++    const struct vsh_frame fout = {
++        .plane = {(uintptr_t)out->planes[0], (uintptr_t)out->planes[1]},
++        .pitch = {out->stride[0], out->stride[1]},
++    };
++    int64_t serial = -1;
++    int rc = p->api.pull(p->vsh, &fout, &serial);
++    bool ok = rc == 0;
++    if (ok) {
++        // A single 1080p colour conversion on our own stream: short and bounded.
++        ok = CHECK_CU(p->cu->cuEventRecord(p->pull_evt, p->stream)) >= 0 &&
++             CHECK_CU(p->cu->cuEventSynchronize(p->pull_evt)) >= 0;
++    } else if (rc < 0) {
++        MP_ERR(vf, "pull failed: %s\n", p->api.error(p->vsh));
++    }
++    ctx_pop(vf);
++    if (!ok) {
++        talloc_free(out);
++        return NULL;
++    }
++
++    struct mp_image *meta = NULL;
++    if (serial >= p->meta_lo && serial < p->meta_hi) {
++        // serials come out in order; anything skipped below it was dropped by
++        // the host (fail-open frames still in flight at a failure)
++        for (int64_t s = p->meta_lo; s < serial; s++)
++            mp_image_unrefp(&p->meta[s % MAX_SERIALS]);
++        meta = p->meta[serial % MAX_SERIALS];
++        p->meta[serial % MAX_SERIALS] = NULL;
++        p->meta_lo = serial + 1;
++    }
++    if (!meta) {
++        MP_WARN(vf, "host returned unknown frame %lld - dropped\n", (long long)serial);
++        talloc_free(out);
++        return NULL;
++    }
++    mp_image_copy_attributes(out, meta);
++    talloc_free(meta);
++    out->params = p->out_params;
++    if (!p->first_out_logged) {
++        MP_INFO(vf, "first enhanced frame out\n");
++        p->first_out_logged = true;
++    }
++    return out;
++}
++
++static bool pre_seek_target(struct mp_filter *vf, struct mp_image *mpi)
++{
++    struct priv *p = vf->priv;
++    if (!p->opts->skip_seek_pre_target || mpi->pts == MP_NOPTS_VALUE)
++        return false;
++    struct mp_stream_info *info = mp_filter_find_stream_info(vf);
++    double target;
++    if (!(info && info->get_hrseek && info->get_hrseek(info, &target)))
++        return false;
++    return mpi->pts < target - 0.005;
++}
++
++static bool same_format(struct mp_image_params *a, struct mp_image_params *b)
++{
++    return a->imgfmt == b->imgfmt && a->hw_subfmt == b->hw_subfmt &&
++           a->w == b->w && a->h == b->h && a->p_w == b->p_w && a->p_h == b->p_h &&
++           a->color.transfer == b->color.transfer;
++}
++
++static void vf_vsrhost_process(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    struct mp_pin *in = vf->ppins[0], *outp = vf->ppins[1];
++
++    release_inputs(vf, false);
++
++    // 1. Output: finished frames, in serial order.
++    if (p->active) {
++        while (mp_pin_in_needs_data(outp)) {
++            int r = p->api.ready(p->vsh);
++            if (r <= 0)
++                break;
++            struct mp_image *o = pull_frame(vf);
++            if (!o)
++                break;
++            mp_pin_in_write(outp, MAKE_FRAME(MP_FRAME_VIDEO, o));
++        }
++        // Drained after EOF or before a format change.
++        if (p->flushed && p->api.ready(p->vsh) == -1) {
++            if (p->reinit_after_drain) {
++                destroy_host(vf);
++                av_buffer_unref(&p->hw_pool);
++                p->have_params = false;      // the held frame reconfigures below
++            } else {
++                // EOF is waiting in the input pin; reset so a following file
++                // (or a seek back) starts a fresh stream.
++                p->api.reset(p->vsh);
++                clear_meta(vf);
++                p->flushed = false;
++                if (!mp_pin_in_needs_data(outp))
++                    return;
++                struct mp_frame f = mp_pin_out_read(in);
++                if (f.type == MP_FRAME_EOF) {
++                    mp_pin_in_write(outp, f);
++                    return;
++                }
++                mp_pin_out_unread(in, f);
++            }
++        }
++        if (p->flushed)
++            return;
++    }
++
++    // 2. Input: read ahead of output demand while the host accepts frames.
++    for (;;) {
++        if (p->active) {
++            // don't read ahead without bound while output is not consumed
++            if (p->meta_hi - p->meta_lo >= MAX_SERIALS)
++                break;
++        } else if (!mp_pin_in_needs_data(outp)) {
++            break;
++        }
++
++        struct mp_frame frame = mp_pin_out_read(in);
++        if (frame.type == MP_FRAME_NONE)
++            break;
++        if (frame.type == MP_FRAME_EOF) {
++            if (p->active && p->meta_hi > p->meta_lo) {
++                MP_VERBOSE(vf, "EOF: draining\n");
++                p->api.flush(p->vsh);
++                p->flushed = true;
++                mp_pin_out_unread(in, frame);   // forwarded once drained
++                mp_filter_internal_mark_progress(vf);
++                return;
++            }
++            if (p->active) {
++                p->api.reset(p->vsh);
++                clear_meta(vf);
++            }
++            if (mp_pin_in_needs_data(outp)) {
++                mp_pin_in_write(outp, frame);
++            } else {
++                mp_pin_out_unread(in, frame);
++            }
++            return;
++        }
++        if (frame.type != MP_FRAME_VIDEO) {
++            MP_ERR(vf, "discarding unknown frame type\n");
++            mp_frame_unref(&frame);
++            continue;
++        }
++
++        struct mp_image *mpi = frame.data;
++        if (!p->have_params || !same_format(&p->in_params, &mpi->params)) {
++            if (p->active && p->meta_hi > p->meta_lo) {
++                MP_VERBOSE(vf, "format change: draining\n");
++                p->api.flush(p->vsh);
++                p->flushed = true;
++                p->reinit_after_drain = true;
++                mp_pin_out_unread(in, frame);
++                mp_filter_internal_mark_progress(vf);
++                return;
++            }
++            destroy_host(vf);
++            configure(vf, mpi);
++        }
++
++        if (!p->active) {
++            // passthrough (off, disabled, or not for this stream)
++            if (mp_pin_in_needs_data(outp)) {
++                mp_pin_in_write(outp, frame);
++            } else {
++                mp_pin_out_unread(in, frame);
++                break;
++            }
++            continue;
++        }
++
++        if (pre_seek_target(vf, mpi)) {
++            talloc_free(mpi);   // discarded after the filter anyway: skip the network
++            continue;
++        }
++
++        int rc = push_frame(vf, mpi);
++        if (rc == VSH_BUSY) {
++            // engines loading or the host's input buffers are full; the host
++            // wakes us when that changes
++            mp_pin_out_unread(in, frame);
++            break;
++        }
++        if (rc < 0) {
++            char *why = talloc_asprintf(vf, "push failed: %s", p->api.error(p->vsh));
++            destroy_host(vf);
++            go_off(vf, why);
++            talloc_free(why);
++            mp_pin_out_unread(in, frame);
++            mp_filter_internal_mark_progress(vf);
++            return;
++        }
++    }
++}
++
++static void vf_vsrhost_reset(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    if (p->active)
++        p->api.reset(p->vsh);
++    release_inputs(vf, true);
++    clear_meta(vf);
++    p->flushed = false;
++    if (p->reinit_after_drain) {
++        destroy_host(vf);
++        p->have_params = false;
++    }
++}
++
++static bool vf_vsrhost_command(struct mp_filter *vf, struct mp_filter_command *cmd)
++{
++    struct priv *p = vf->priv;
++    if (cmd->type != MP_FILTER_COMMAND_TEXT || !cmd->cmd || !cmd->arg)
++        return false;
++    if (!strcmp(cmd->cmd, "enable")) {
++        bool en = strcmp(cmd->arg, "0") && strcmp(cmd->arg, "no");
++        if (en != p->enabled) {
++            p->enabled = en;
++            destroy_host(vf);
++            p->have_params = false;   // next frame configures (or passes through)
++        }
++    } else {
++        return false;
++    }
++    mp_filter_wakeup(vf);
++    return true;
++}
++
++static void uninit(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    release_device_state(vf);
++    if (p->api.handle)
++        lib_close(p->api.handle);
++    if (p->cu)
++        cuda_free_functions(&p->cu);
++}
++
++static const struct mp_filter_info vf_vsrhost_filter = {
++    .name = "vsrhost",
++    .process = vf_vsrhost_process,
++    .command = vf_vsrhost_command,
++    .reset = vf_vsrhost_reset,
++    .destroy = uninit,
++    .priv_size = sizeof(struct priv),
++};
++
++static struct mp_filter *vf_vsrhost_create(struct mp_filter *parent, void *options)
++{
++    struct mp_filter *f = mp_filter_create(parent, &vf_vsrhost_filter);
++    if (!f) {
++        talloc_free(options);
++        return NULL;
++    }
++    mp_filter_add_pin(f, MP_PIN_IN, "in");
++    mp_filter_add_pin(f, MP_PIN_OUT, "out");
++
++    struct priv *p = f->priv;
++    p->opts = talloc_steal(p, options);
++    p->enabled = p->opts->enable;
++
++    if (cuda_load_functions(&p->cu, NULL) < 0) {
++        p->cu = NULL;
++        go_off(f, "CUDA driver API unavailable");
++    }
++
++    const char *lib = p->opts->host && p->opts->host[0] ? p->opts->host : VSH_DEFAULT_LIB;
++    p->host_path = mp_normalize_user_path(p, f->global, lib);
++    if (p->cu) {
++        p->api.handle = lib_open(p->host_path);
++        if (!p->api.handle) {
++            char *why = talloc_asprintf(p, "super-resolution host '%s' not loaded", p->host_path);
++            go_off(f, why);
++        } else {
++            struct host_api *a = &p->api;
++            a->abi = lib_sym(a->handle, "vsh_abi");
++            a->create = lib_sym(a->handle, "vsh_create");
++            a->push = lib_sym(a->handle, "vsh_push");
++            a->flush = lib_sym(a->handle, "vsh_flush");
++            a->reset = lib_sym(a->handle, "vsh_reset");
++            a->ready = lib_sym(a->handle, "vsh_ready");
++            a->pull = lib_sym(a->handle, "vsh_pull");
++            a->stats = lib_sym(a->handle, "vsh_get_stats");
++            a->error = lib_sym(a->handle, "vsh_error");
++            a->destroy = lib_sym(a->handle, "vsh_destroy");
++            if (!a->abi || !a->create || !a->push || !a->flush || !a->reset || !a->ready ||
++                !a->pull || !a->error || !a->destroy || a->abi() != VSH_ABI)
++            {
++                lib_close(a->handle);
++                memset(a, 0, sizeof(*a));
++                go_off(f, "super-resolution host has a different ABI");
++            } else {
++                MP_VERBOSE(f, "Loaded super-resolution host: %s\n", p->host_path);
++            }
++        }
++    }
++    return f;
++}
++
++#define OPT_BASE_STRUCT struct opts
++static const m_option_t vf_opts_fields[] = {
++    {"host", OPT_STRING(host), .flags = M_OPT_FILE},
++    {"enable", OPT_BOOL(enable)},
++    {"identity", OPT_BOOL(identity)},
++    {"skip-seek-pre-target", OPT_BOOL(skip_seek_pre_target)},
++    {0}
++};
++
++const struct mp_user_filter_entry vf_vsrhost = {
++    .desc = {
++        .description = "GPU-resident video super-resolution through a host library (CUDA)",
++        .name = "vsrhost",
++        .priv_size = sizeof(OPT_BASE_STRUCT),
++        .priv_defaults = &(const OPT_BASE_STRUCT) {
++            .enable = true,
++            .skip_seek_pre_target = true,
++        },
++        .options = vf_opts_fields,
++    },
++    .create = vf_vsrhost_create,
++};
+diff --git a/video/filter/vsrhost.h b/video/filter/vsrhost.h
+new file mode 100644
+index 0000000000..ce88b1c515
+--- /dev/null
++++ b/video/filter/vsrhost.h
+@@ -0,0 +1,104 @@
++/*
++ * vsrhost.h - C ABI between mpv's vf_vsrhost and a video super-resolution host DLL (push/pull, output larger than input,
++ * multi-frame latency, EOF drain). VSH_ABI 1, 2026-10-08.
++ *
++ * Threading: every call below is made from ONE thread (mpv's filter thread) and returns without waiting on the GPU
++ * (target < 5 ms; vsh_create/vsh_destroy excepted). GPU work the caller can see (input conversion in vsh_push, output
++ * conversion in vsh_pull) is enqueued on desc.cu_stream inside desc.cu_context; the network runs on the host's own
++ * worker thread and stream. When output becomes ready the host calls desc.wakeup(desc.wakeup_opaque) from that worker
++ * thread (mpv: mp_filter_wakeup).
++ *
++ * Frame order: output frame i carries input frame i's serial (the caller maps serial -> pts/duration). After
++ * vsh_flush every pushed frame comes out, then vsh_ready() returns -1 (drained). vsh_reset drops everything
++ * pending (seek) without waiting for the GPU.
++ *
++ * Fail-open: if the network fails at run time the host switches to identity (colour conversion + bilinear scale) and
++ * keeps producing frames in order; vsh_error() then describes the failure. vsh_create fails (returns < 0) when the
++ * host cannot run at all (missing engines, unsupported format); the caller then passes video through untouched.
++ *
++ * This header is part of mpv (LGPL 2.1+). Hosts are separate programs.
++ */
++#ifndef VSRHOST_H
++#define VSRHOST_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define VSH_ABI 1
++
++enum vsh_fmt   { VSH_NV12 = 1, VSH_RGB24_TEST = 100 };   /* RGB24_TEST: packed 8-bit RGB in/out, harness only */
++enum vsh_mat   { VSH_MAT_601 = 1, VSH_MAT_709 = 2 };
++enum vsh_range { VSH_RANGE_LIMITED = 1, VSH_RANGE_FULL = 2 };
++enum vsh_log   { VSH_LOG_ERROR = 0, VSH_LOG_WARN = 1, VSH_LOG_INFO = 2, VSH_LOG_DEBUG = 3 };
++enum vsh_push_rc { VSH_OK = 0, VSH_BUSY = 1 };
++
++struct vsh_desc {
++    uint32_t abi;                    /* VSH_ABI */
++    void *cu_context;                /* CUcontext the caller's frames live in */
++    void *cu_stream;                 /* CUstream for the conversions in push/pull */
++    int in_w, in_h;                  /* input size (even) */
++    int fmt;                         /* enum vsh_fmt, input; output is NV12 BT.709 limited (RGB24 for the test format) */
++    int matrix, range;               /* input colour, enum vsh_mat / vsh_range */
++    int par_num, par_den;            /* input pixel aspect */
++    int out_w, out_h;                /* OUT: output size chosen by the host (square pixels, BT.709) */
++    int lookahead;                   /* OUT: frames held before the first output (28) */
++    const char *host_dir;            /* directory with swiftvr.conf, NULL = the DLL's own */
++    void (*log)(void *opaque, int level, const char *msg);
++    void *log_opaque;
++    void (*wakeup)(void *opaque);    /* called from the host's worker thread when vsh_ready() may have grown */
++    void *wakeup_opaque;
++    int identity;                    /* 1 = never run the network (plumbing test / forced fail-open) */
++};
++
++struct vsh_frame {
++    uintptr_t plane[2];              /* CUdeviceptr: luma, interleaved chroma (RGB24_TEST: plane[0] only) */
++    int pitch[2];                    /* bytes */
++};
++
++struct vsh_stats {                   /* diagnostics (harness, OSD) */
++    int engines_ready;               /* 1 once the engines are loaded, -1 if loading failed */
++    double load_s;                   /* create -> engines ready */
++    int chunks;                      /* chunks run since create */
++    double last_chunk_ms[4];         /* GPU ms of the last chunk: encoder, DiT, decoder, total */
++    double max_chunk_total_ms;
++    int failed;                      /* 1 = switched to identity after a run-time failure */
++    int64_t frames_in, frames_out;
++    double vram_gb;                  /* device memory the host allocated (engines + buffers) */
++};
++
++struct vsh;
++
++#ifdef VSH_HOST_BUILD
++#define VSH_EXPORT __declspec(dllexport)
++VSH_EXPORT uint32_t    vsh_abi(void);
++VSH_EXPORT int         vsh_create(struct vsh_desc *desc, struct vsh **out);          /* 0 ok; fills out_w/out_h/lookahead */
++VSH_EXPORT int         vsh_push(struct vsh *, const struct vsh_frame *in, int64_t serial); /* 0 ok, 1 BUSY (pull first), <0 error */
++VSH_EXPORT int         vsh_push_event(struct vsh *, void **cu_event);   /* CUevent: completes when the last push no longer reads its frame */
++VSH_EXPORT int         vsh_flush(struct vsh *);                         /* EOF: process what is pending */
++VSH_EXPORT int         vsh_reset(struct vsh *);                         /* seek: drop everything, start a new stream */
++VSH_EXPORT int         vsh_ready(struct vsh *);                         /* frames ready to pull; -1 = flushed and drained */
++VSH_EXPORT int         vsh_pull(struct vsh *, const struct vsh_frame *out, int64_t *serial); /* 0 ok, 1 nothing ready, <0 error */
++VSH_EXPORT int         vsh_pull_event(struct vsh *, void **cu_event);   /* CUevent: completes when the last pull's output is written */
++VSH_EXPORT int         vsh_get_stats(struct vsh *, struct vsh_stats *);
++VSH_EXPORT const char *vsh_error(struct vsh *);
++VSH_EXPORT void        vsh_destroy(struct vsh **);
++#endif
++
++typedef uint32_t    (*vsh_abi_fn)(void);
++typedef int         (*vsh_create_fn)(struct vsh_desc *, struct vsh **);
++typedef int         (*vsh_push_fn)(struct vsh *, const struct vsh_frame *, int64_t);
++typedef int         (*vsh_event_fn)(struct vsh *, void **);
++typedef int         (*vsh_simple_fn)(struct vsh *);
++typedef int         (*vsh_pull_fn)(struct vsh *, const struct vsh_frame *, int64_t *);
++typedef int         (*vsh_stats_fn)(struct vsh *, struct vsh_stats *);
++typedef const char *(*vsh_error_fn)(struct vsh *);
++typedef void        (*vsh_destroy_fn)(struct vsh **);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+-- 
+2.54.0.windows.1
+
