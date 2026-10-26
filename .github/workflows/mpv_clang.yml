@@ -136,7 +136,19 @@ jobs:
             fail=0
             while read -r name sha; do
               d="src_packages/$name"
-              [ -d "$d/.git" ] || { echo "LOCK: $name has no checkout (skipped, not built from git?)"; continue; }
+              # packages/CMakeLists.txt leaves curl and libsixel out of the `download` target, so on a
+              # cold cache they had no checkout here and were cloned mid-build at upstream HEAD
+              # (run 40402045097: curl HEAD needs an OpenSSL newer than ours). Download steps are
+              # INDEPENDENT (CMP0114), so fetching one builds none of its dependencies.
+              [ -d "$d/.git" ] || ninja -C build_$BIT "$name-download" </dev/null >/dev/null 2>&1 || true
+              if [ ! -d "$d/.git" ]; then
+                if grep -q GIT_REPOSITORY "packages/$name.cmake" 2>/dev/null; then
+                  echo "LOCK FAIL: $name has no checkout even after its download step"; fail=1
+                else
+                  echo "LOCK: $name has no checkout (not built from git)"
+                fi
+                continue
+              fi
               git config --global --add safe.directory "$PWD/$d"
               if ! git -C "$d" cat-file -e "$sha^{commit}" 2>/dev/null; then
                 git -C "$d" fetch -q origin "$sha" || git -C "$d" fetch -q --unshallow origin || git -C "$d" fetch -q origin
