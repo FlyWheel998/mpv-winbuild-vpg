@@ -156,8 +156,20 @@ jobs:
           fi
           # Record the exact commit of every package this build used (PLAN_aji_port Stage P2), so the
           # next stage can pin them and two builds from the same recipe are provably identical.
+          # A package the recipe patches (git am) sits on a LOCAL commit that exists only in this
+          # runner's cache; recording it broke the first build after GitHub evicted the cache (run
+          # 40392616656: six "not our ref"). Record the upstream commit it was built on instead -
+          # the patch step re-applies the patches on a fresh checkout.
           for d in src_packages/*/; do
-            if [ -d "$d/.git" ]; then echo "$(basename "$d") $(git -C "$d" rev-parse HEAD)"; else echo "$(basename "$d") no-git"; fi
+            if [ -d "$d/.git" ]; then
+              sha=$(git -C "$d" rev-parse HEAD)
+              if [ -z "$(git -C "$d" branch -r --contains "$sha" 2>/dev/null)" ]; then
+                sha=$(git -C "$d" merge-base HEAD '@{u}' 2>/dev/null || git -C "$d" rev-parse HEAD)
+              fi
+              echo "$(basename "$d") $sha"
+            else
+              echo "$(basename "$d") no-git"
+            fi
           done | sort > LOCK.txt
           echo "LOCK.txt: $(wc -l < LOCK.txt) packages"
           # Build libdovi EXPLICITLY. ExternalProject hangs a DEPENDS edge off the dependent's
