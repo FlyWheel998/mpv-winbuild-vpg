@@ -1,0 +1,248 @@
+From a1d441f5243b949239905cd3a468da1e1ec6301c Mon Sep 17 00:00:00 2001
+From: FlyWheel998 <127964164+FlyWheel998@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 23:13:52 -0500
+Subject: [PATCH] vf_vsrhost: 10-bit P010 + HDR input for hosts with ABI 2
+ (host tone-maps)
+
+A host that exports vsh_caps() with VSH_CAP_P010_HDR now receives the
+decoder's 10-bit CUDA surfaces unconverted, with the source colour
+(transfer, primaries, chroma location, Dolby Vision flag, mastering and
+content light levels) in the ABI-2 tail of vsh_desc. The host converts
+PQ/HLG to SDR itself on the filter's stream, so nothing in the push path
+waits on the GPU. Output frames are tagged SDR BT.709/BT.1886 with the
+HDR metadata and the Dolby Vision RPU dropped, so the VO does not tone-map
+a second time.
+
+vsh_abi() stays 1, so hosts without vsh_caps (and older players with new
+hosts) behave exactly as before: 10-bit input is converted to nv12 in
+front and HDR sources play the original picture.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012jfU49QexqjmWH3kywHUtF
+---
+ video/filter/vf_vsrhost.c | 94 ++++++++++++++++++++++++++++++++++++---
+ video/filter/vsrhost.h    | 25 +++++++++--
+ 2 files changed, 109 insertions(+), 10 deletions(-)
+
+diff --git a/video/filter/vf_vsrhost.c b/video/filter/vf_vsrhost.c
+index fcedf2aec2..7f682ca3f2 100644
+--- a/video/filter/vf_vsrhost.c
++++ b/video/filter/vf_vsrhost.c
+@@ -84,6 +84,7 @@ struct opts {
+ 
+ struct host_api {
+     void *handle;
++    uint32_t caps;              // vsh_caps() (ABI 2), 0 for ABI-1 hosts
+     vsh_abi_fn abi;
+     vsh_create_fn create;
+     vsh_push_fn push;
+@@ -113,6 +114,7 @@ struct priv {
+     struct mp_image_params in_params, out_params;
+     bool have_params;
+ 
++    bool hdr_out;               // the host tone-maps: output frames are retagged SDR, Dolby Vision RPU dropped
+     bool active;                // host created for the current stream
+     bool off;                   // failed open for this filter instance (one warning given)
+     bool enabled;               // runtime enable (vf-command)
+@@ -350,21 +352,46 @@ static void configure(struct mp_filter *vf, struct mp_image *in)
+         return;
+     }
+ 
++    const bool hdr_cap = p->api.caps & VSH_CAP_P010_HDR;
++    // Dolby Vision: the decoded surface is the base layer; describe that, not the RPU mapping.
++    const bool dovi = in->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION;
++    const enum pl_color_transfer trc = dovi ? in->params.transfer_orig : in->params.color.transfer;
++    const enum pl_color_primaries prim = dovi ? in->params.primaries_orig : in->params.color.primaries;
++    const enum pl_color_system sys = dovi ? in->params.sys_orig : in->params.repr.sys;
++
+     enum AVPixelFormat sw = imgfmt2pixfmt(in->params.hw_subfmt);
+-    if (sw != AV_PIX_FMT_NV12) {
+-        char *why = talloc_asprintf(vf, "unsupported surface format %s (8-bit nv12 only)",
++    const bool p010 = sw == AV_PIX_FMT_P010;
++    if (sw != AV_PIX_FMT_NV12 && !(p010 && hdr_cap)) {
++        char *why = talloc_asprintf(vf, p010 ? "10-bit surface: host cannot take it (needs a host with "
++                                               "ABI 2 / VSH_CAP_P010_HDR)"
++                                             : "unsupported surface format %s (8-bit nv12 only)",
+                                     mp_imgfmt_to_name(in->params.hw_subfmt));
+         go_off(vf, why);
+         talloc_free(why);
+         return;
+     }
+-    if (pl_color_transfer_is_hdr(in->params.color.transfer)) {
+-        go_off(vf, "HDR source");
+-        return;
++    if (pl_color_transfer_is_hdr(trc) || dovi) {
++        if (!hdr_cap || !p010) {
++            go_off(vf, hdr_cap ? "HDR source on an 8-bit surface (needs hwdec=nvdec 10-bit frames)"
++                               : "HDR source");
++            return;
++        }
++        if (trc != PL_COLOR_TRC_PQ && trc != PL_COLOR_TRC_HLG) {
++            char *why = talloc_asprintf(vf, "HDR transfer %s not supported (PQ and HLG only)",
++                                        m_opt_choice_str(pl_csp_trc_names, trc));
++            go_off(vf, why);
++            talloc_free(why);
++            return;
++        }
++        if (sys != PL_COLOR_SYSTEM_BT_2020_NC && sys != PL_COLOR_SYSTEM_BT_709) {
++            go_off(vf, dovi ? "Dolby Vision without an HDR10/SDR base layer (profile 5) is not supported"
++                            : "HDR colour matrix not supported (BT.2020 non-constant or BT.709 only)");
++            return;
++        }
+     }
+ 
+     struct vsh_desc d = {
+-        .abi = VSH_ABI,
++        .abi = hdr_cap ? VSH_ABI_2 : VSH_ABI,
+         .cu_context = p->cuda_ctx,
+         .cu_stream = p->stream,
+         .in_w = in->params.w, .in_h = in->params.h,
+@@ -380,6 +407,36 @@ static void configure(struct mp_filter *vf, struct mp_image *in)
+         .wakeup_opaque = vf,
+         .identity = o->identity,
+     };
++    if (p010) {
++        d.fmt = VSH_P010;
++        d.matrix = sys == PL_COLOR_SYSTEM_BT_2020_NC ? VSH_MAT_2020NC :
++                   sys == PL_COLOR_SYSTEM_BT_601 ? VSH_MAT_601 :
++                   sys == PL_COLOR_SYSTEM_BT_709 ? VSH_MAT_709 :
++                   prim == PL_COLOR_PRIM_BT_2020 ? VSH_MAT_2020NC : map_matrix(&in->params);
++    }
++    if (hdr_cap) {
++        d.transfer = trc == PL_COLOR_TRC_PQ ? VSH_TRC_PQ : trc == PL_COLOR_TRC_HLG ? VSH_TRC_HLG : VSH_TRC_SDR;
++        d.primaries = prim == PL_COLOR_PRIM_BT_2020 ? VSH_PRIM_2020 :
++                      prim == PL_COLOR_PRIM_DCI_P3 || prim == PL_COLOR_PRIM_DISPLAY_P3 ? VSH_PRIM_P3 :
++                      prim == PL_COLOR_PRIM_BT_709 || prim == PL_COLOR_PRIM_UNKNOWN ? VSH_PRIM_709 :
++                      VSH_PRIM_OTHER;
++        enum pl_chroma_location cl = in->params.chroma_location;
++        d.chroma_loc = cl == PL_CHROMA_LEFT || cl == PL_CHROMA_UNKNOWN ? VSH_CLOC_LEFT :
++                       cl == PL_CHROMA_CENTER ? VSH_CLOC_CENTER :
++                       cl == PL_CHROMA_TOP_LEFT ? VSH_CLOC_TOPLEFT : VSH_CLOC_OTHER;
++        d.dovi = dovi;
++        d.min_luma = in->params.color.hdr.min_luma;
++        d.max_luma = in->params.color.hdr.max_luma;
++        d.max_cll = in->params.color.hdr.max_cll;
++        d.max_fall = in->params.color.hdr.max_fall;
++    }
++    p->hdr_out = p010 && d.transfer != VSH_TRC_SDR;
++    if (p010) {
++        MP_INFO(vf, "%dx%d p010 %s/%s%s (mastering %.4g-%.4g nits) -> host %s\n",
++                in->params.w, in->params.h, m_opt_choice_str(pl_csp_trc_names, trc),
++                m_opt_choice_str(pl_csp_prim_names, prim), dovi ? ", Dolby Vision base layer" : "",
++                d.min_luma, d.max_luma, p->hdr_out ? "tone-maps to SDR bt.1886/bt.709" : "converts 10-bit SDR");
++    }
+     if (p->api.create(&d, &p->vsh) != 0) {
+         char *why = talloc_asprintf(vf, "host refused the stream: %s", p->api.error(NULL));
+         go_off(vf, why);
+@@ -394,6 +451,17 @@ static void configure(struct mp_filter *vf, struct mp_image *in)
+     p->out_params.repr.sys = PL_COLOR_SYSTEM_BT_709;
+     p->out_params.repr.levels = PL_COLOR_LEVELS_LIMITED;
+     p->out_params.crop = (struct mp_rect){0, 0, d.out_w, d.out_h};
++    if (p010) {
++        // The host wrote 8-bit SDR BT.709 / BT.1886 (tone-mapped if the source was HDR): say so, and drop
++        // everything that would make the VO tone-map (or reshape) a second time.
++        p->out_params.color = (struct pl_color_space){ .primaries = PL_COLOR_PRIM_BT_709,
++                                                        .transfer = PL_COLOR_TRC_BT_1886 };
++        p->out_params.repr.dovi = NULL;
++        p->out_params.primaries_orig = PL_COLOR_PRIM_BT_709;
++        p->out_params.transfer_orig = PL_COLOR_TRC_BT_1886;
++        p->out_params.sys_orig = PL_COLOR_SYSTEM_BT_709;
++        p->out_params.light = MP_CSP_LIGHT_DISPLAY;
++    }
+     p->active = true;
+     p->flushed = false;
+     clear_meta(vf);
+@@ -520,6 +588,11 @@ static struct mp_image *pull_frame(struct mp_filter *vf)
+     mp_image_copy_attributes(out, meta);
+     talloc_free(meta);
+     out->params = p->out_params;
++    if (p->in_params.hw_subfmt == pixfmt2imgfmt(AV_PIX_FMT_P010)) {
++        // copied from the input with the attributes; the picture is SDR now
++        av_buffer_unref(&out->dovi);
++        out->params.color.hdr = (struct pl_hdr_metadata){0};
++    }
+     if (!p->first_out_logged) {
+         MP_INFO(vf, "first enhanced frame out\n");
+         p->first_out_logged = true;
+@@ -784,7 +857,14 @@ static struct mp_filter *vf_vsrhost_create(struct mp_filter *parent, void *optio
+                 memset(a, 0, sizeof(*a));
+                 go_off(f, "super-resolution host has a different ABI");
+             } else {
+-                MP_VERBOSE(f, "Loaded super-resolution host: %s\n", p->host_path);
++                vsh_caps_fn caps = lib_sym(a->handle, "vsh_caps");
++                a->caps = caps ? caps() : 0;
++                // ABI 2 hosts take the decoder's 10-bit surfaces as they are (HDR tone-mapped by the host);
++                // for older hosts 10-bit input is still converted to nv12 in front, as before.
++                if (a->caps & VSH_CAP_P010_HDR)
++                    mp_autoconvert_add_imgfmt(p->conv, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_P010));
++                MP_VERBOSE(f, "Loaded super-resolution host: %s (caps 0x%x)\n", p->host_path,
++                           (unsigned)a->caps);
+             }
+         }
+     }
+diff --git a/video/filter/vsrhost.h b/video/filter/vsrhost.h
+index ce88b1c515..758ce043f1 100644
+--- a/video/filter/vsrhost.h
++++ b/video/filter/vsrhost.h
+@@ -1,6 +1,6 @@
+ /*
+  * vsrhost.h - C ABI between mpv's vf_vsrhost and a video super-resolution host DLL (push/pull, output larger than input,
+- * multi-frame latency, EOF drain). VSH_ABI 1, 2026-10-08.
++ * multi-frame latency, EOF drain). VSH_ABI 1, 2026-10-08; ABI 2 extension (10-bit HDR input), 2026-11-08.
+  *
+  * Threading: every call below is made from ONE thread (mpv's filter thread) and returns without waiting on the GPU
+  * (target < 5 ms; vsh_create/vsh_destroy excepted). GPU work the caller can see (input conversion in vsh_push, output
+@@ -29,8 +29,18 @@ extern "C" {
+ 
+ #define VSH_ABI 1
+ 
+-enum vsh_fmt   { VSH_NV12 = 1, VSH_RGB24_TEST = 100 };   /* RGB24_TEST: packed 8-bit RGB in/out, harness only */
+-enum vsh_mat   { VSH_MAT_601 = 1, VSH_MAT_709 = 2 };
++/* ABI 2 (2026-11-08): a host that exports vsh_caps() returning VSH_CAP_P010_HDR also takes 10-bit P010 frames
++ * (HDR PQ/HLG or SDR) and must tone-map HDR to SDR itself; output stays NV12 BT.709 limited, SDR BT.1886. vsh_abi()
++ * keeps returning VSH_ABI (1) so older players still load the host; the caller then sets desc.abi = VSH_ABI_2 and
++ * fills the fields after `identity`. Hosts without vsh_caps never see P010 or HDR and read only the v1 prefix. */
++#define VSH_ABI_2 2
++#define VSH_CAP_P010_HDR (1u << 0)
++
++enum vsh_fmt   { VSH_NV12 = 1, VSH_P010 = 2, VSH_RGB24_TEST = 100 };   /* P010: ABI 2 only */   /* RGB24_TEST: packed 8-bit RGB in/out, harness only */
++enum vsh_mat   { VSH_MAT_601 = 1, VSH_MAT_709 = 2, VSH_MAT_2020NC = 3 };   /* 2020NC: ABI 2, P010 only */
++enum vsh_trc   { VSH_TRC_SDR = 0, VSH_TRC_PQ = 1, VSH_TRC_HLG = 2 };
++enum vsh_prim  { VSH_PRIM_709 = 0, VSH_PRIM_2020 = 1, VSH_PRIM_P3 = 2, VSH_PRIM_OTHER = 3 };
++enum vsh_cloc  { VSH_CLOC_LEFT = 0, VSH_CLOC_CENTER = 1, VSH_CLOC_TOPLEFT = 2, VSH_CLOC_OTHER = 3 };
+ enum vsh_range { VSH_RANGE_LIMITED = 1, VSH_RANGE_FULL = 2 };
+ enum vsh_log   { VSH_LOG_ERROR = 0, VSH_LOG_WARN = 1, VSH_LOG_INFO = 2, VSH_LOG_DEBUG = 3 };
+ enum vsh_push_rc { VSH_OK = 0, VSH_BUSY = 1 };
+@@ -51,6 +61,13 @@ struct vsh_desc {
+     void (*wakeup)(void *opaque);    /* called from the host's worker thread when vsh_ready() may have grown */
+     void *wakeup_opaque;
+     int identity;                    /* 1 = never run the network (plumbing test / forced fail-open) */
++    /* ABI 2 only (abi == VSH_ABI_2): source colour of the input frames */
++    int transfer;                    /* enum vsh_trc */
++    int primaries;                   /* enum vsh_prim */
++    int chroma_loc;                  /* enum vsh_cloc */
++    int dovi;                        /* 1 = Dolby Vision stream; the frames are its base layer (RPU not applied) */
++    float min_luma, max_luma;        /* mastering display, cd/m2 (0 = unknown) */
++    float max_cll, max_fall;         /* content light level, cd/m2 (0 = unknown) */
+ };
+ 
+ struct vsh_frame {
+@@ -74,6 +91,7 @@ struct vsh;
+ #ifdef VSH_HOST_BUILD
+ #define VSH_EXPORT __declspec(dllexport)
+ VSH_EXPORT uint32_t    vsh_abi(void);
++VSH_EXPORT uint32_t    vsh_caps(void);                                  /* optional (ABI 2): VSH_CAP_* bits */
+ VSH_EXPORT int         vsh_create(struct vsh_desc *desc, struct vsh **out);          /* 0 ok; fills out_w/out_h/lookahead */
+ VSH_EXPORT int         vsh_push(struct vsh *, const struct vsh_frame *in, int64_t serial); /* 0 ok, 1 BUSY (pull first), <0 error */
+ VSH_EXPORT int         vsh_push_event(struct vsh *, void **cu_event);   /* CUevent: completes when the last push no longer reads its frame */
+@@ -88,6 +106,7 @@ VSH_EXPORT void        vsh_destroy(struct vsh **);
+ #endif
+ 
+ typedef uint32_t    (*vsh_abi_fn)(void);
++typedef uint32_t    (*vsh_caps_fn)(void);
+ typedef int         (*vsh_create_fn)(struct vsh_desc *, struct vsh **);
+ typedef int         (*vsh_push_fn)(struct vsh *, const struct vsh_frame *, int64_t);
+ typedef int         (*vsh_event_fn)(struct vsh *, void **);
+-- 
+2.54.0.windows.1
+
