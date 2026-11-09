@@ -1,4 +1,4 @@
-From d74fafd3f277345196b6608ef2145f6a0e3deb66 Mon Sep 17 00:00:00 2001
+From d91db3229ebdc99020f21ef0c21c88cb9849d2a0 Mon Sep 17 00:00:00 2001
 From: FlyWheel998 <127964164+FlyWheel998@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 23:13:52 -0500
 Subject: [PATCH] vf_vsrhost: 10-bit P010 + HDR input for hosts with ABI 2
@@ -24,12 +24,12 @@ the per-scene brightness the VO itself would use.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_012jfU49QexqjmWH3kywHUtF
 ---
- video/filter/vf_vsrhost.c | 113 +++++++++++++++++++++++++++++++++++---
+ video/filter/vf_vsrhost.c | 116 +++++++++++++++++++++++++++++++++++---
  video/filter/vsrhost.h    |  36 +++++++++++-
- 2 files changed, 138 insertions(+), 11 deletions(-)
+ 2 files changed, 141 insertions(+), 11 deletions(-)
 
 diff --git a/video/filter/vf_vsrhost.c b/video/filter/vf_vsrhost.c
-index fcedf2aec2..1e868cc10d 100644
+index fcedf2aec2..eec7c9245b 100644
 --- a/video/filter/vf_vsrhost.c
 +++ b/video/filter/vf_vsrhost.c
 @@ -84,9 +84,11 @@ struct opts {
@@ -142,10 +142,13 @@ index fcedf2aec2..1e868cc10d 100644
      if (p->api.create(&d, &p->vsh) != 0) {
          char *why = talloc_asprintf(vf, "host refused the stream: %s", p->api.error(NULL));
          go_off(vf, why);
-@@ -394,6 +452,17 @@ static void configure(struct mp_filter *vf, struct mp_image *in)
+@@ -394,6 +452,20 @@ static void configure(struct mp_filter *vf, struct mp_image *in)
      p->out_params.repr.sys = PL_COLOR_SYSTEM_BT_709;
      p->out_params.repr.levels = PL_COLOR_LEVELS_LIMITED;
      p->out_params.crop = (struct mp_rect){0, 0, d.out_w, d.out_h};
++    // the host always writes NV12 (alloc_out's pool); a P010 input must not leave its format on the output, or the
++    // VO maps the NV12 surface with 16-bit pitches (cuMemcpy2DAsync INVALID_VALUE, F-R1091)
++    p->out_params.hw_subfmt = pixfmt2imgfmt(AV_PIX_FMT_NV12);
 +    if (p010) {
 +        // The host wrote 8-bit SDR BT.709 / BT.1886 (tone-mapped if the source was HDR): say so, and drop
 +        // everything that would make the VO tone-map (or reshape) a second time.
@@ -160,7 +163,7 @@ index fcedf2aec2..1e868cc10d 100644
      p->active = true;
      p->flushed = false;
      clear_meta(vf);
-@@ -447,7 +516,21 @@ static int push_frame(struct mp_filter *vf, struct mp_image *in)
+@@ -447,7 +519,21 @@ static int push_frame(struct mp_filter *vf, struct mp_image *in)
          .pitch = {in->stride[0], in->stride[1]},
      };
      int64_t serial = p->next_serial;
@@ -183,7 +186,7 @@ index fcedf2aec2..1e868cc10d 100644
      if (rc != VSH_OK) {
          ctx_pop(vf);
          return rc;
-@@ -520,6 +603,11 @@ static struct mp_image *pull_frame(struct mp_filter *vf)
+@@ -520,6 +606,11 @@ static struct mp_image *pull_frame(struct mp_filter *vf)
      mp_image_copy_attributes(out, meta);
      talloc_free(meta);
      out->params = p->out_params;
@@ -195,7 +198,7 @@ index fcedf2aec2..1e868cc10d 100644
      if (!p->first_out_logged) {
          MP_INFO(vf, "first enhanced frame out\n");
          p->first_out_logged = true;
-@@ -784,7 +872,16 @@ static struct mp_filter *vf_vsrhost_create(struct mp_filter *parent, void *optio
+@@ -784,7 +875,16 @@ static struct mp_filter *vf_vsrhost_create(struct mp_filter *parent, void *optio
                  memset(a, 0, sizeof(*a));
                  go_off(f, "super-resolution host has a different ABI");
              } else {
