@@ -1,4 +1,4 @@
-From a1d441f5243b949239905cd3a468da1e1ec6301c Mon Sep 17 00:00:00 2001
+From d74fafd3f277345196b6608ef2145f6a0e3deb66 Mon Sep 17 00:00:00 2001
 From: FlyWheel998 <127964164+FlyWheel998@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 23:13:52 -0500
 Subject: [PATCH] vf_vsrhost: 10-bit P010 + HDR input for hosts with ABI 2
@@ -17,18 +17,22 @@ vsh_abi() stays 1, so hosts without vsh_caps (and older players with new
 hosts) behave exactly as before: 10-bit input is converted to nv12 in
 front and HDR sources play the original picture.
 
+Optional vsh_push2() hands the host each frame's own HDR metadata
+(HDR10+ scene values, Dolby Vision L1 max/avg PQ), so a host can follow
+the per-scene brightness the VO itself would use.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_012jfU49QexqjmWH3kywHUtF
 ---
- video/filter/vf_vsrhost.c | 94 ++++++++++++++++++++++++++++++++++++---
- video/filter/vsrhost.h    | 25 +++++++++--
- 2 files changed, 109 insertions(+), 10 deletions(-)
+ video/filter/vf_vsrhost.c | 113 +++++++++++++++++++++++++++++++++++---
+ video/filter/vsrhost.h    |  36 +++++++++++-
+ 2 files changed, 138 insertions(+), 11 deletions(-)
 
 diff --git a/video/filter/vf_vsrhost.c b/video/filter/vf_vsrhost.c
-index fcedf2aec2..7f682ca3f2 100644
+index fcedf2aec2..1e868cc10d 100644
 --- a/video/filter/vf_vsrhost.c
 +++ b/video/filter/vf_vsrhost.c
-@@ -84,6 +84,7 @@ struct opts {
+@@ -84,9 +84,11 @@ struct opts {
  
  struct host_api {
      void *handle;
@@ -36,7 +40,11 @@ index fcedf2aec2..7f682ca3f2 100644
      vsh_abi_fn abi;
      vsh_create_fn create;
      vsh_push_fn push;
-@@ -113,6 +114,7 @@ struct priv {
++    vsh_push2_fn push2;         // optional (ABI 2): push with per-frame HDR metadata
+     vsh_simple_fn flush, reset, ready;
+     vsh_pull_fn pull;
+     vsh_stats_fn stats;
+@@ -113,6 +115,7 @@ struct priv {
      struct mp_image_params in_params, out_params;
      bool have_params;
  
@@ -44,7 +52,7 @@ index fcedf2aec2..7f682ca3f2 100644
      bool active;                // host created for the current stream
      bool off;                   // failed open for this filter instance (one warning given)
      bool enabled;               // runtime enable (vf-command)
-@@ -350,21 +352,46 @@ static void configure(struct mp_filter *vf, struct mp_image *in)
+@@ -350,21 +353,46 @@ static void configure(struct mp_filter *vf, struct mp_image *in)
          return;
      }
  
@@ -97,7 +105,7 @@ index fcedf2aec2..7f682ca3f2 100644
          .cu_context = p->cuda_ctx,
          .cu_stream = p->stream,
          .in_w = in->params.w, .in_h = in->params.h,
-@@ -380,6 +407,36 @@ static void configure(struct mp_filter *vf, struct mp_image *in)
+@@ -380,6 +408,36 @@ static void configure(struct mp_filter *vf, struct mp_image *in)
          .wakeup_opaque = vf,
          .identity = o->identity,
      };
@@ -134,7 +142,7 @@ index fcedf2aec2..7f682ca3f2 100644
      if (p->api.create(&d, &p->vsh) != 0) {
          char *why = talloc_asprintf(vf, "host refused the stream: %s", p->api.error(NULL));
          go_off(vf, why);
-@@ -394,6 +451,17 @@ static void configure(struct mp_filter *vf, struct mp_image *in)
+@@ -394,6 +452,17 @@ static void configure(struct mp_filter *vf, struct mp_image *in)
      p->out_params.repr.sys = PL_COLOR_SYSTEM_BT_709;
      p->out_params.repr.levels = PL_COLOR_LEVELS_LIMITED;
      p->out_params.crop = (struct mp_rect){0, 0, d.out_w, d.out_h};
@@ -152,7 +160,30 @@ index fcedf2aec2..7f682ca3f2 100644
      p->active = true;
      p->flushed = false;
      clear_meta(vf);
-@@ -520,6 +588,11 @@ static struct mp_image *pull_frame(struct mp_filter *vf)
+@@ -447,7 +516,21 @@ static int push_frame(struct mp_filter *vf, struct mp_image *in)
+         .pitch = {in->stride[0], in->stride[1]},
+     };
+     int64_t serial = p->next_serial;
+-    int rc = p->api.push(p->vsh, &fin, serial);
++    int rc;
++    if (p->api.push2 && p->in_params.hw_subfmt == pixfmt2imgfmt(AV_PIX_FMT_P010)) {
++        // per-frame HDR metadata (HDR10+ scene values, Dolby Vision L1) for hosts that tone-map per scene
++        const struct pl_hdr_metadata *hm = &in->params.color.hdr;
++        const struct vsh_frame_meta fm = {
++            .min_luma = hm->min_luma, .max_luma = hm->max_luma,
++            .max_cll = hm->max_cll, .max_fall = hm->max_fall,
++            .scene_max = {hm->scene_max[0], hm->scene_max[1], hm->scene_max[2]}, .scene_avg = hm->scene_avg,
++            .max_pq_y = hm->max_pq_y, .avg_pq_y = hm->avg_pq_y,
++            .dovi_rpu = in->params.repr.dovi != NULL,
++        };
++        rc = p->api.push2(p->vsh, &fin, serial, &fm);
++    } else {
++        rc = p->api.push(p->vsh, &fin, serial);
++    }
+     if (rc != VSH_OK) {
+         ctx_pop(vf);
+         return rc;
+@@ -520,6 +603,11 @@ static struct mp_image *pull_frame(struct mp_filter *vf)
      mp_image_copy_attributes(out, meta);
      talloc_free(meta);
      out->params = p->out_params;
@@ -164,13 +195,15 @@ index fcedf2aec2..7f682ca3f2 100644
      if (!p->first_out_logged) {
          MP_INFO(vf, "first enhanced frame out\n");
          p->first_out_logged = true;
-@@ -784,7 +857,14 @@ static struct mp_filter *vf_vsrhost_create(struct mp_filter *parent, void *optio
+@@ -784,7 +872,16 @@ static struct mp_filter *vf_vsrhost_create(struct mp_filter *parent, void *optio
                  memset(a, 0, sizeof(*a));
                  go_off(f, "super-resolution host has a different ABI");
              } else {
 -                MP_VERBOSE(f, "Loaded super-resolution host: %s\n", p->host_path);
 +                vsh_caps_fn caps = lib_sym(a->handle, "vsh_caps");
 +                a->caps = caps ? caps() : 0;
++                if (a->caps & VSH_CAP_P010_HDR)
++                    a->push2 = lib_sym(a->handle, "vsh_push2");
 +                // ABI 2 hosts take the decoder's 10-bit surfaces as they are (HDR tone-mapped by the host);
 +                // for older hosts 10-bit input is still converted to nv12 in front, as before.
 +                if (a->caps & VSH_CAP_P010_HDR)
@@ -181,7 +214,7 @@ index fcedf2aec2..7f682ca3f2 100644
          }
      }
 diff --git a/video/filter/vsrhost.h b/video/filter/vsrhost.h
-index ce88b1c515..758ce043f1 100644
+index ce88b1c515..57e64f7ae7 100644
 --- a/video/filter/vsrhost.h
 +++ b/video/filter/vsrhost.h
 @@ -1,6 +1,6 @@
@@ -227,22 +260,44 @@ index ce88b1c515..758ce043f1 100644
  };
  
  struct vsh_frame {
-@@ -74,6 +91,7 @@ struct vsh;
+@@ -58,6 +75,14 @@ struct vsh_frame {
+     int pitch[2];                    /* bytes */
+ };
+ 
++struct vsh_frame_meta {               /* ABI 2: per-frame HDR metadata of the pushed frame (vsh_push2) */
++    float min_luma, max_luma;        /* mastering display, cd/m2 */
++    float max_cll, max_fall;         /* content light level, cd/m2 */
++    float scene_max[3], scene_avg;   /* HDR10+ dynamic metadata, cd/m2 (0 = absent) */
++    float max_pq_y, avg_pq_y;        /* Dolby Vision L1 / CIE Y, PQ 0-1 (0 = absent) */
++    int dovi_rpu;                    /* 1 = the frame carried a Dolby Vision RPU */
++};
++
+ struct vsh_stats {                   /* diagnostics (harness, OSD) */
+     int engines_ready;               /* 1 once the engines are loaded, -1 if loading failed */
+     double load_s;                   /* create -> engines ready */
+@@ -74,8 +99,11 @@ struct vsh;
  #ifdef VSH_HOST_BUILD
  #define VSH_EXPORT __declspec(dllexport)
  VSH_EXPORT uint32_t    vsh_abi(void);
 +VSH_EXPORT uint32_t    vsh_caps(void);                                  /* optional (ABI 2): VSH_CAP_* bits */
  VSH_EXPORT int         vsh_create(struct vsh_desc *desc, struct vsh **out);          /* 0 ok; fills out_w/out_h/lookahead */
  VSH_EXPORT int         vsh_push(struct vsh *, const struct vsh_frame *in, int64_t serial); /* 0 ok, 1 BUSY (pull first), <0 error */
++VSH_EXPORT int         vsh_push2(struct vsh *, const struct vsh_frame *in, int64_t serial,
++                                 const struct vsh_frame_meta *meta);   /* optional (ABI 2): vsh_push + metadata */
  VSH_EXPORT int         vsh_push_event(struct vsh *, void **cu_event);   /* CUevent: completes when the last push no longer reads its frame */
-@@ -88,6 +106,7 @@ VSH_EXPORT void        vsh_destroy(struct vsh **);
+ VSH_EXPORT int         vsh_flush(struct vsh *);                         /* EOF: process what is pending */
+ VSH_EXPORT int         vsh_reset(struct vsh *);                         /* seek: drop everything, start a new stream */
+@@ -88,8 +116,10 @@ VSH_EXPORT void        vsh_destroy(struct vsh **);
  #endif
  
  typedef uint32_t    (*vsh_abi_fn)(void);
 +typedef uint32_t    (*vsh_caps_fn)(void);
  typedef int         (*vsh_create_fn)(struct vsh_desc *, struct vsh **);
  typedef int         (*vsh_push_fn)(struct vsh *, const struct vsh_frame *, int64_t);
++typedef int         (*vsh_push2_fn)(struct vsh *, const struct vsh_frame *, int64_t, const struct vsh_frame_meta *);
  typedef int         (*vsh_event_fn)(struct vsh *, void **);
+ typedef int         (*vsh_simple_fn)(struct vsh *);
+ typedef int         (*vsh_pull_fn)(struct vsh *, const struct vsh_frame *, int64_t *);
 -- 
 2.54.0.windows.1
 
