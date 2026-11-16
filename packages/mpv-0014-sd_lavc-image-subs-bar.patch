@@ -1,0 +1,92 @@
+From 72abcdd38cc0d62dc1e6f2756108065fdbde1c27 Mon Sep 17 00:00:00 2001
+From: FlyWheel998 <127964164+FlyWheel998@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 01:05:50 -0500
+Subject: [PATCH] sd_lavc: --image-subs-bar moves bitmap subtitles into the
+ bottom black bar
+
+--sub-pos can only move PGS/VobSub/DVB bitmaps inside the subtitle canvas, which
+is then mapped onto the video rectangle, so they can never reach the letterbox
+margin. With --image-subs-bar (and blend-subtitles=no) the lower-half subtitle
+block is centred in the bottom margin after scaling, never lower than
+--sub-margin-y(+offset) above the screen edge, and only ever moved down.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012jfU48c4Xqsq2oSLMcyRHT
+---
+ options/options.c |  1 +
+ options/options.h |  1 +
+ sub/sd_lavc.c     | 34 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 36 insertions(+)
+
+diff --git a/options/options.c b/options/options.c
+index e8b590af8c..378455272c 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -310,6 +310,7 @@ const struct m_sub_options mp_subtitle_sub_opts = {
+         {"stretch-dvd-subs", OPT_BOOL(stretch_dvd_subs)},
+         {"stretch-image-subs-to-screen", OPT_BOOL(stretch_image_subs)},
+         {"image-subs-video-resolution", OPT_BOOL(image_subs_video_res)},
++        {"image-subs-bar", OPT_BOOL(image_subs_bar)},
+         {"sub-fix-timing", OPT_BOOL(sub_fix_timing)},
+         {"sub-fix-timing-threshold", OPT_INT(sub_fix_timing_threshold)},
+         {"sub-fix-timing-keep", OPT_INT(sub_fix_timing_keep)},
+diff --git a/options/options.h b/options/options.h
+index 26a791343f..4472aae513 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -102,6 +102,7 @@ struct mp_subtitle_opts {
+     bool stretch_dvd_subs;
+     bool stretch_image_subs;
+     bool image_subs_video_res;
++    bool image_subs_bar;
+     bool sub_fix_timing;
+     int sub_fix_timing_threshold;
+     int sub_fix_timing_keep;
+diff --git a/sub/sd_lavc.c b/sub/sd_lavc.c
+index ce9416e8da..2838be0470 100644
+--- a/sub/sd_lavc.c
++++ b/sub/sd_lavc.c
+@@ -585,6 +585,40 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
+         }
+     }
+ 
++    // --image-subs-bar (VideoPlayerGold): move bitmap subtitles (PGS/VobSub/DVB) DOWN into the bottom black bar when there is
++    // one. The --sub-pos path above can only move them within the subtitle canvas, which osd_rescale_bitmaps then maps onto
++    // the video rectangle, so they can never leave the picture. Here we work in screen pixels after scaling: take the parts
++    // whose top is in the lower half of the picture (the subtitle block; signs at the top stay where they are), centre the
++    // block in the bar, but keep its bottom at least --sub-margin-y (+ offset, 720-line units like ASS) above the screen
++    // edge so the script that lifts subtitles over the on-screen controls still works. Only ever moves them down. Needs
++    // blend-subtitles=no (with blending the margins are not part of the subtitle area, d.mb is 0 and this does nothing).
++    if (opts->image_subs_bar && d.mb > 0 && res->num_parts > 0) {
++        int vid_top = d.mt, vid_bot = d.h - d.mb, vid_mid = (vid_top + vid_bot) / 2;
++        int y0 = INT_MAX, y1 = INT_MIN;
++        for (int n = 0; n < res->num_parts; n++) {
++            struct sub_bitmap *sub = &res->parts[n];
++            if (sub->y < vid_mid)
++                continue;
++            y0 = MPMIN(y0, sub->y);
++            y1 = MPMAX(y1, sub->y + sub->dh);
++        }
++        if (y1 > y0) {
++            int bh = y1 - y0;
++            int margin = (opts->sub_style->margin_y + opts->sub_style->margin_y_offset) * d.h / 720;
++            int top = vid_bot + (d.mb - bh) / 2;
++            if (top + bh > d.h - margin)
++                top = d.h - margin - bh;
++            int delta = top - y0;
++            if (delta > 0) {
++                for (int n = 0; n < res->num_parts; n++) {
++                    struct sub_bitmap *sub = &res->parts[n];
++                    if (sub->y >= vid_mid)
++                        sub->y += delta;
++                }
++            }
++        }
++    }
++
+     if (priv->prevret_num != res->num_parts)
+         res->change_id++;
+ 
+-- 
+2.54.0.windows.1
+
