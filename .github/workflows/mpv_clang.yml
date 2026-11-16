@@ -108,7 +108,7 @@ jobs:
           # --disable-sandbox: pacman 7's download sandbox (Landlock + user alpm) cannot be applied inside this
           # container (run 37178435716: "restricting filesystem access failed because the Landlock ruleset could not be applied").
           pacman -Sy --noconfirm --needed --disable-sandbox shaderc
-          command -v glslc && glslc --version | head -1
+          command -v glslc && glslc --version 2>&1 | sed -n 1p   # sed reads all input: head -1 closed the pipe early and pipefail turned the SIGPIPE (141) into a failed step (run 43814497955)
           set +e
           # Diagnostic (B1): repeat FFmpeg configure's probe_glslc/check_glslc exactly and print why it passes or fails.
           echo "which: $(which -a glslc glslang glslangValidator 2>&1 | tr '\n' ' ')"
