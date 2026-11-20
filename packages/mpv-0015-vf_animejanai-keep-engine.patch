@@ -1,0 +1,200 @@
+From 91276f032874609314503daf29bb2bd7f99ca9d6 Mon Sep 17 00:00:00 2001
+From: VideoPlayerGold <vpg@localhost>
+Date: Fri, 20 Nov 2026 17:00:20 -0500
+Subject: [PATCH] vf_animejanai: keep-engine - reuse the inference context
+ across filter instances
+
+---
+ video/filter/vf_animejanai.c | 118 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 116 insertions(+), 2 deletions(-)
+
+diff --git a/video/filter/vf_animejanai.c b/video/filter/vf_animejanai.c
+index 30bed265df..085e4b6a56 100644
+--- a/video/filter/vf_animejanai.c
++++ b/video/filter/vf_animejanai.c
+@@ -70,6 +70,7 @@
+ #include "filters/user_filters.h"
+ #include "options/m_option.h"
+ #include "options/path.h"
++#include "osdep/threads.h"
+ #include "refqueue.h"
+ #include "video/fmt-conversion.h"
+ #include "video/mp_image.h"
+@@ -148,6 +149,7 @@ struct opts {
+     bool skip_seek_pre_target;
+     bool output_444;
+     int queue_depth;
++    bool keep_engine;
+ };
+ 
+ #define MAX_DEPTH 4
+@@ -221,6 +223,7 @@ struct priv {
+     bool aji_active;     // a chain/engine is configured; else passthrough copy
+     bool configured;     // saw at least one reinit
+     int cur_slot, pending_slot;
++    int keep_max_w, keep_max_h;   // largest picture the context was created for (keep-engine)
+ 
+     struct mp_refqueue *queue;
+     struct mp_image_params params, out_params;
+@@ -314,13 +317,106 @@ static bool order_after_decode(struct mp_filter *vf)
+     return ok;
+ }
+ 
++// --- engine kept between filter instances (option keep-engine, VideoPlayerGold 2026-11-20) -------------------------
++// A player that VacuumTube keeps loaded between videos rebuilds this filter for every video, and with it the inference
++// context: ~0.1 s create + ~0.1 s configure per video (logs/plays/*71168*warm2*.log 85.388 -> 85.594) although the
++// CUDA context (the video output's) is the same. With keep-engine, destroy parks the context here instead of
++// destroying it, and the next instance on the same CUDA context, same conf and no larger picture adopts it.
++// The library binds its log callback at create time, so an engine created with keep-engine logs through aji_keep
++// (opaque == &aji_keep): lines go to whichever filter owns it now, and are dropped while it is parked. The library
++// stays loaded (one extra reference) while a context is parked. Never used for D3D11.
++static mp_static_mutex aji_keep_lock = MP_STATIC_MUTEX_INITIALIZER;
++static struct {
++    struct mp_filter *log_vf;   // owner of the log lines of keep-engine contexts; NULL = drop
++    aji_ctx *ctx;               // parked context, or NULL
++    void *handle;               // extra library reference held for the parked context
++    void (*destroy)(aji_ctx **c);
++    CUcontext cuda;
++    int max_w, max_h;
++    char conf[1024];
++} aji_keep;
++
+ static void aji_log_bridge(void *opaque, int level, const char *msg)
+ {
+-    struct mp_filter *vf = opaque;
+     int mp_level = level <= 1 ? MSGL_ERR : level == 2 ? MSGL_WARN : MSGL_V;
++    if (opaque == (void *)&aji_keep) {
++        mp_mutex_lock(&aji_keep_lock);
++        if (aji_keep.log_vf)
++            mp_msg(aji_keep.log_vf->log, mp_level, "[aji] %s\n", msg);
++        mp_mutex_unlock(&aji_keep_lock);
++        return;
++    }
++    struct mp_filter *vf = opaque;
+     mp_msg(vf->log, mp_level, "[aji] %s\n", msg);
+ }
+ 
++// Adopt the parked context if it fits this instance (same CUDA context and conf, picture no larger). Returns NULL
++// if nothing fits; the caller then creates a new one.
++static aji_ctx *keep_take(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    aji_ctx *c = NULL;
++    void *h = NULL;
++    mp_mutex_lock(&aji_keep_lock);
++    if (aji_keep.ctx && aji_keep.cuda == p->cuda_ctx &&
++        p->params.w <= aji_keep.max_w && p->params.h <= aji_keep.max_h &&
++        strcmp(aji_keep.conf, p->path.conf ? p->path.conf : "") == 0)
++    {
++        c = aji_keep.ctx;
++        h = aji_keep.handle;
++        p->keep_max_w = aji_keep.max_w;
++        p->keep_max_h = aji_keep.max_h;
++        aji_keep.ctx = NULL;
++        aji_keep.handle = NULL;
++        aji_keep.log_vf = vf;
++    }
++    mp_mutex_unlock(&aji_keep_lock);
++    if (h)
++        aji_lib_close(h);   // this instance's own reference (p->api.handle) keeps the library loaded
++    return c;
++}
++
++// Park this instance's context instead of destroying it. Any previously parked context is destroyed.
++static bool keep_put(struct mp_filter *vf)
++{
++    struct priv *p = vf->priv;
++    if (!p->aji || !p->opts->keep_engine || p->is_d3d11 || !p->cuda_ctx || !p->path.lib)
++        return false;
++    void *h = aji_lib_open(p->path.lib);   // extra reference while parked
++    if (!h)
++        return false;
++    mp_mutex_lock(&aji_keep_lock);
++    aji_ctx *old = aji_keep.ctx;
++    void *old_h = aji_keep.handle;
++    void (*old_destroy)(aji_ctx **c) = aji_keep.destroy;
++    aji_keep.ctx = p->aji;
++    aji_keep.handle = h;
++    aji_keep.destroy = p->api.destroy;
++    aji_keep.cuda = p->cuda_ctx;
++    aji_keep.max_w = p->keep_max_w;
++    aji_keep.max_h = p->keep_max_h;
++    snprintf(aji_keep.conf, sizeof(aji_keep.conf), "%s", p->path.conf ? p->path.conf : "");
++    if (aji_keep.log_vf == vf)
++        aji_keep.log_vf = NULL;
++    mp_mutex_unlock(&aji_keep_lock);
++    p->aji = NULL;
++    if (old) {
++        old_destroy(&old);
++        aji_lib_close(old_h);
++    }
++    MP_VERBOSE(vf, "inference context kept for the next video (keep-engine)\n");
++    return true;
++}
++
++// This instance is going away: its context's log lines must not reach it any more.
++static void keep_forget(struct mp_filter *vf)
++{
++    mp_mutex_lock(&aji_keep_lock);
++    if (aji_keep.log_vf == vf)
++        aji_keep.log_vf = NULL;
++    mp_mutex_unlock(&aji_keep_lock);
++}
++
+ static int map_matrix(struct mp_image_params *params)
+ {
+     switch (params->repr.sys) {
+@@ -1424,6 +1520,12 @@ static void vf_animejanai_process(struct mp_filter *vf)
+             return;
+         }
+ 
++        if (p->api.handle && !p->aji && p->opts->keep_engine && !p->is_d3d11) {
++            p->aji = keep_take(vf);
++            if (p->aji)
++                MP_VERBOSE(vf, "reusing the kept inference context (keep-engine)\n");
++        }
++
+         if (p->api.handle && !p->aji) {
+             // mpv suboption values cannot contain '=', so the option takes a
+             // plain lib dir and the env assignment is composed here.
+@@ -1447,8 +1549,15 @@ static void vf_animejanai_process(struct mp_filter *vf)
+                 .max_width = p->params.w,
+                 .max_height = p->params.h,
+                 .log = aji_log_bridge,
+-                .log_opaque = vf,
++                .log_opaque = (p->opts->keep_engine && !p->is_d3d11) ? (void *)&aji_keep : (void *)vf,
+             };
++            if (p->opts->keep_engine && !p->is_d3d11) {
++                mp_mutex_lock(&aji_keep_lock);
++                aji_keep.log_vf = vf;
++                mp_mutex_unlock(&aji_keep_lock);
++            }
++            p->keep_max_w = p->params.w;
++            p->keep_max_h = p->params.h;
+             p->aji = p->api.create(&cp);
+             if (!p->aji) {
+                 MP_ERR(vf, "Failed to create inference context\n");
+@@ -1812,8 +1921,12 @@ static void uninit(struct mp_filter *vf)
+ 
+     flush_frames(vf);
+     talloc_free(p->queue);
++    // flush_frames() above already finished every submitted inference (clear_ring + drain_backend)
++    if (p->aji && p->opts->keep_engine && !p->is_d3d11)
++        keep_put(vf);
+     if (p->aji)
+         p->api.destroy(&p->aji);
++    keep_forget(vf);
+     if (p->api.handle)
+         aji_lib_close(p->api.handle);
+     if (p->own_stream && p->cu &&
+@@ -2008,6 +2121,7 @@ static const m_option_t vf_opts_fields[] = {
+     {"skip-seek-pre-target", OPT_BOOL(skip_seek_pre_target)},
+     {"output-444", OPT_BOOL(output_444)},
+     {"queue-depth", OPT_INT(queue_depth), M_RANGE(1, MAX_DEPTH)},
++    {"keep-engine", OPT_BOOL(keep_engine)},
+     {0}
+ };
+ 
+-- 
+2.54.0.windows.1
+
