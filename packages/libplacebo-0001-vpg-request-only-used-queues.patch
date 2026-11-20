@@ -1,0 +1,53 @@
+From a2582c79740d1be8b7f257210d5130beee13f6cc Mon Sep 17 00:00:00 2001
+From: VideoPlayerGold <vpg@localhost>
+Date: Fri, 20 Nov 2026 14:08:56 -0500
+Subject: [PATCH] vulkan: request only the queues that are used
+ (VideoPlayerGold, faster device creation)
+
+---
+ src/vulkan/context.c | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/src/vulkan/context.c b/src/vulkan/context.c
+index ddf7496d..6c970e5a 100644
+--- a/src/vulkan/context.c
++++ b/src/vulkan/context.c
+@@ -1370,16 +1370,32 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
+     // with other API users (e.g. FFmpeg)
+     PL_ARRAY(VkDeviceQueueCreateInfo) qinfos = {0};
+     for (int i = 0; i < qfnum; i++) {
+-        bool use_qf = i == idx_gfx || i == idx_comp || i == idx_tf;
++        bool internal_qf = i == idx_gfx || i == idx_comp || i == idx_tf;
++        bool use_qf = internal_qf;
+         use_qf |= qfs[i].queueFlags & params->extra_queues;
+         if (!use_qf)
+             continue;
++        // VideoPlayerGold: request only the queues that are used. The families
++        // libplacebo uses itself are restricted to `queue_count` further down
++        // (and only that restricted count is published in pl_vulkan.queue_*,
++        // which is what API users such as mpv hand to FFmpeg), so creating the
++        // rest of them only costs time: ~17 ms per queue on NVIDIA, 31 queues
++        // -> ~0.5 s per player start. Extra families (video decode, optical
++        // flow) keep their full count, because mpv advertises those counts to
++        // FFmpeg directly. VPG_VK_ALL_QUEUES=1 restores upstream behaviour.
++        uint32_t qcount = qfs[i].queueCount;
++        const char *all_q = getenv("VPG_VK_ALL_QUEUES");
++        if (internal_qf && !(all_q && all_q[0] == '1')) {
++            const uint32_t qlim = PL_DEF(params->queue_count, UINT32_MAX);
++            if (qlim < qcount)
++                qcount = qlim;
++        }
+         PL_ARRAY_APPEND(tmp, qinfos, (VkDeviceQueueCreateInfo) {
+             .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+             .flags = qflags,
+             .queueFamilyIndex = i,
+-            .queueCount = qfs[i].queueCount,
+-            .pQueuePriorities = pl_calloc(tmp, qfs[i].queueCount, sizeof(float)),
++            .queueCount = qcount,
++            .pQueuePriorities = pl_calloc(tmp, qcount, sizeof(float)),
+         });
+     }
+ 
+-- 
+2.54.0.windows.1
+

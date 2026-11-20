@@ -15,6 +15,14 @@ ExternalProject_Add(libplacebo
     GIT_CLONE_FLAGS "--filter=tree:0"
     GIT_SUBMODULES ""
     UPDATE_COMMAND ""
+    # VideoPlayerGold patches (2026-11-20): libplacebo-0001 asks the driver only for the queues
+    # that are used (31 -> 5 on NVIDIA, ~0.45 s off every player start; FINDINGS F-R1204).
+    # Same idempotent shape as mpv.cmake: abort any half-applied am, rewind to the commit the
+    # patches were made against (= packages/LOCK.txt), clean, apply. Nothing here watches the
+    # recipe, so a run that changes a patch must be dispatched with the custom command
+    # `ninja -C build_x86_64_v3 libplacebo-fullclean mpv-fullclean` (FINDINGS line ~9035).
+    PATCH_COMMAND ${EXEC} bash -c "cd <SOURCE_DIR> && (git am --abort >/dev/null 2>&1 || true) && git reset --hard 92b5ac6db79f4d680eb656692f7bf51e9606f42a -q && git clean -fdq"
+    COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/libplacebo-*.patch
     CONFIGURE_COMMAND ""
     COMMAND bash -c "rm -rf <SOURCE_DIR>/3rdparty/glad"
     COMMAND bash -c "rm -rf <SOURCE_DIR>/3rdparty/fast_float"
