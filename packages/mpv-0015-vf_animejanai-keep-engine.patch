@@ -1,15 +1,17 @@
-From 91276f032874609314503daf29bb2bd7f99ca9d6 Mon Sep 17 00:00:00 2001
+From e2555823952b9b5ce12b7f2323bb142d939a5065 Mon Sep 17 00:00:00 2001
 From: VideoPlayerGold <vpg@localhost>
 Date: Fri, 20 Nov 2026 17:00:20 -0500
 Subject: [PATCH] vf_animejanai: keep-engine - reuse the inference context
  across filter instances
 
+Parks the aji context (with its CUDA stream, events and an FFmpeg device reference) at filter destroy when keep-engine=yes; the next instance on the same CUDA context, same library, same conf/engine/model paths and no larger picture adopts it. A context that reported an error is never parked; a non-matching parked context is destroyed at once; hwdec_cuda drops any context parked on a CUDA context before destroying it (also covers process exit). Review findings D1-D5 and U1 (2026-11-20).
 ---
- video/filter/vf_animejanai.c | 118 ++++++++++++++++++++++++++++++++++-
- 1 file changed, 116 insertions(+), 2 deletions(-)
+ video/filter/vf_animejanai.c | 233 ++++++++++++++++++++++++++++++++++-
+ video/out/hwdec/hwdec_cuda.c |   8 ++
+ 2 files changed, 239 insertions(+), 2 deletions(-)
 
 diff --git a/video/filter/vf_animejanai.c b/video/filter/vf_animejanai.c
-index 30bed265df..085e4b6a56 100644
+index 30bed265df..2b12970b75 100644
 --- a/video/filter/vf_animejanai.c
 +++ b/video/filter/vf_animejanai.c
 @@ -70,6 +70,7 @@
@@ -28,15 +30,16 @@ index 30bed265df..085e4b6a56 100644
  };
  
  #define MAX_DEPTH 4
-@@ -221,6 +223,7 @@ struct priv {
+@@ -221,6 +223,8 @@ struct priv {
      bool aji_active;     // a chain/engine is configured; else passthrough copy
      bool configured;     // saw at least one reinit
      int cur_slot, pending_slot;
 +    int keep_max_w, keep_max_h;   // largest picture the context was created for (keep-engine)
++    bool aji_bad;                 // the context reported an error: destroy it, never park it (keep-engine)
  
      struct mp_refqueue *queue;
      struct mp_image_params params, out_params;
-@@ -314,13 +317,106 @@ static bool order_after_decode(struct mp_filter *vf)
+@@ -314,13 +318,212 @@ static bool order_after_decode(struct mp_filter *vf)
      return ok;
  }
  
@@ -55,9 +58,79 @@ index 30bed265df..085e4b6a56 100644
 +    void *handle;               // extra library reference held for the parked context
 +    void (*destroy)(aji_ctx **c);
 +    CUcontext cuda;
++    AVBufferRef *dev;           // keeps an FFmpeg-created CUDA device alive while parked
++    CUstream stream;            // the stream the context ran on (it may have captured CUDA graphs on it)
++    CUevent evt[MAX_DEPTH];
++    bool evt_ok;
 +    int max_w, max_h;
-+    char conf[1024];
++    char key[4096];             // conf|engine|model-dir|rife-model-dir
 +} aji_keep;
++
++static void keep_key(struct priv *p, char *buf, size_t size)
++{
++    snprintf(buf, size, "%s|%s|%s|%s", p->path.conf ? p->path.conf : "", p->path.engine ? p->path.engine : "",
++             p->path.model_dir ? p->path.model_dir : "", p->path.rife_model_dir ? p->path.rife_model_dir : "");
++}
++
++// Everything parked, taken out under the lock; released after it (destroy may log through aji_log_bridge).
++struct keep_parked {
++    aji_ctx *ctx;
++    void *handle;
++    void (*destroy)(aji_ctx **c);
++    CUcontext cuda;
++    AVBufferRef *dev;
++    CUstream stream;
++    CUevent evt[MAX_DEPTH];
++};
++
++static void keep_detach_locked(struct keep_parked *out)
++{
++    *out = (struct keep_parked){ .ctx = aji_keep.ctx, .handle = aji_keep.handle, .destroy = aji_keep.destroy,
++                                 .cuda = aji_keep.cuda, .dev = aji_keep.dev, .stream = aji_keep.stream };
++    for (int i = 0; i < MAX_DEPTH; i++) {
++        out->evt[i] = aji_keep.evt[i];
++        aji_keep.evt[i] = NULL;
++    }
++    aji_keep.ctx = NULL;
++    aji_keep.handle = NULL;
++    aji_keep.dev = NULL;
++    aji_keep.stream = NULL;
++    aji_keep.evt_ok = false;
++}
++
++// cu may be NULL: then the stream/events are not freed (they die with the CUDA context).
++static void keep_release(struct keep_parked *k, CudaFunctions *cu)
++{
++    if (!k->ctx)
++        return;
++    k->destroy(&k->ctx);
++    if (cu && k->cuda && (k->stream || k->evt[0]) && cu->cuCtxPushCurrent(k->cuda) == CUDA_SUCCESS) {
++        CUcontext dummy;
++        if (k->stream)
++            cu->cuStreamSynchronize(k->stream);
++        for (int i = 0; i < MAX_DEPTH; i++)
++            if (k->evt[i])
++                cu->cuEventDestroy(k->evt[i]);
++        if (k->stream)
++            cu->cuStreamDestroy(k->stream);
++        cu->cuCtxPopCurrent(&dummy);
++    }
++    av_buffer_unref(&k->dev);
++    aji_lib_close(k->handle);
++}
++
++// Called by the CUDA hwdec (hwdec_cuda.c) just before it destroys a CUDA context, and usable for any teardown:
++// destroys a context parked on that CUDA context (or any, for NULL) while CUDA is still alive. (review D1)
++void vf_animejanai_keep_drop(void *cuda_ctx, void *cuda_functions);
++void vf_animejanai_keep_drop(void *cuda_ctx, void *cuda_functions)
++{
++    struct keep_parked k = {0};
++    mp_mutex_lock(&aji_keep_lock);
++    if (aji_keep.ctx && (!cuda_ctx || (void *)aji_keep.cuda == cuda_ctx))
++        keep_detach_locked(&k);
++    mp_mutex_unlock(&aji_keep_lock);
++    keep_release(&k, cuda_functions);
++}
 +
  static void aji_log_bridge(void *opaque, int level, const char *msg)
  {
@@ -79,55 +152,91 @@ index 30bed265df..085e4b6a56 100644
 +static aji_ctx *keep_take(struct mp_filter *vf)
 +{
 +    struct priv *p = vf->priv;
-+    aji_ctx *c = NULL;
-+    void *h = NULL;
++    char key[4096];
++    keep_key(p, key, sizeof(key));
++    struct keep_parked k = {0}, stale = {0};
++    bool evt_ok = false;
 +    mp_mutex_lock(&aji_keep_lock);
-+    if (aji_keep.ctx && aji_keep.cuda == p->cuda_ctx &&
-+        p->params.w <= aji_keep.max_w && p->params.h <= aji_keep.max_h &&
-+        strcmp(aji_keep.conf, p->path.conf ? p->path.conf : "") == 0)
-+    {
-+        c = aji_keep.ctx;
-+        h = aji_keep.handle;
-+        p->keep_max_w = aji_keep.max_w;
-+        p->keep_max_h = aji_keep.max_h;
-+        aji_keep.ctx = NULL;
-+        aji_keep.handle = NULL;
-+        aji_keep.log_vf = vf;
++    if (aji_keep.ctx && aji_keep.cuda == p->cuda_ctx) {
++        if (aji_keep.handle == p->api.handle &&
++            p->params.w <= aji_keep.max_w && p->params.h <= aji_keep.max_h &&
++            strcmp(aji_keep.key, key) == 0)
++        {
++            p->keep_max_w = aji_keep.max_w;
++            p->keep_max_h = aji_keep.max_h;
++            evt_ok = aji_keep.evt_ok;
++            keep_detach_locked(&k);
++            aji_keep.log_vf = vf;
++        } else {
++            keep_detach_locked(&stale);   // same device, does not fit: free its GPU memory now (review D4)
++        }
 +    }
 +    mp_mutex_unlock(&aji_keep_lock);
-+    if (h)
-+        aji_lib_close(h);   // this instance's own reference (p->api.handle) keeps the library loaded
-+    return c;
++    keep_release(&stale, p->cu);
++    if (!k.ctx)
++        return NULL;
++    // Run on the stream the context ran on before (review U1): drop the one this instance made at adoption.
++    if (k.stream) {
++        if (p->own_stream && CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) >= 0) {
++            CUcontext dummy;
++            for (int i = 0; i < MAX_DEPTH; i++)
++                if (p->decode_evt[i])
++                    p->cu->cuEventDestroy(p->decode_evt[i]);
++            p->cu->cuStreamDestroy(p->own_stream);
++            p->cu->cuCtxPopCurrent(&dummy);
++        }
++        p->own_stream = k.stream;
++        p->stream = k.stream;
++        for (int i = 0; i < MAX_DEPTH; i++)
++            p->decode_evt[i] = k.evt[i];
++        p->decode_evt_ok = evt_ok;
++        p->decode_evt_next = 0;
++    }
++    av_buffer_unref(&k.dev);
++    aji_lib_close(k.handle);   // this instance's own reference (p->api.handle) keeps the library loaded
++    return k.ctx;
 +}
 +
 +// Park this instance's context instead of destroying it. Any previously parked context is destroyed.
 +static bool keep_put(struct mp_filter *vf)
 +{
 +    struct priv *p = vf->priv;
-+    if (!p->aji || !p->opts->keep_engine || p->is_d3d11 || !p->cuda_ctx || !p->path.lib)
++    if (!p->aji || p->aji_bad || !p->opts->keep_engine || p->is_d3d11 || !p->cuda_ctx || !p->api.handle)
 +        return false;
-+    void *h = aji_lib_open(p->path.lib);   // extra reference while parked
++    void *h = aji_lib_open(p->path.lib ? p->path.lib : AJI_DEFAULT_LIB);   // extra reference while parked
 +    if (!h)
 +        return false;
++    if (h != p->api.handle) {      // not the module this context came from: do not park (review D2)
++        aji_lib_close(h);
++        return false;
++    }
++    AVBufferRef *dev = p->av_device_ref ? av_buffer_ref(p->av_device_ref) : NULL;
++    struct keep_parked old = {0};
 +    mp_mutex_lock(&aji_keep_lock);
-+    aji_ctx *old = aji_keep.ctx;
-+    void *old_h = aji_keep.handle;
-+    void (*old_destroy)(aji_ctx **c) = aji_keep.destroy;
++    keep_detach_locked(&old);
 +    aji_keep.ctx = p->aji;
 +    aji_keep.handle = h;
 +    aji_keep.destroy = p->api.destroy;
 +    aji_keep.cuda = p->cuda_ctx;
++    aji_keep.dev = dev;
++    aji_keep.stream = p->own_stream;          // parked with the context, not destroyed by uninit (review U1)
++    for (int i = 0; i < MAX_DEPTH; i++)
++        aji_keep.evt[i] = p->own_stream ? p->decode_evt[i] : NULL;
++    aji_keep.evt_ok = p->own_stream ? p->decode_evt_ok : false;
 +    aji_keep.max_w = p->keep_max_w;
 +    aji_keep.max_h = p->keep_max_h;
-+    snprintf(aji_keep.conf, sizeof(aji_keep.conf), "%s", p->path.conf ? p->path.conf : "");
++    keep_key(p, aji_keep.key, sizeof(aji_keep.key));
 +    if (aji_keep.log_vf == vf)
 +        aji_keep.log_vf = NULL;
 +    mp_mutex_unlock(&aji_keep_lock);
 +    p->aji = NULL;
-+    if (old) {
-+        old_destroy(&old);
-+        aji_lib_close(old_h);
++    if (p->own_stream) {
++        p->own_stream = NULL;
++        p->stream = NULL;
++        for (int i = 0; i < MAX_DEPTH; i++)
++            p->decode_evt[i] = NULL;
 +    }
++    keep_release(&old, p->cu);
 +    MP_VERBOSE(vf, "inference context kept for the next video (keep-engine)\n");
 +    return true;
 +}
@@ -144,7 +253,71 @@ index 30bed265df..085e4b6a56 100644
  static int map_matrix(struct mp_image_params *params)
  {
      switch (params->repr.sys) {
-@@ -1424,6 +1520,12 @@ static void vf_animejanai_process(struct mp_filter *vf)
+@@ -358,6 +561,7 @@ static bool drain_ring(struct mp_filter *vf)
+     if (!p->ring_n)
+         return true;
+     if (p->api.wait(p->aji, p->ring[p->ring_n - 1].ticket) != AJI_OK) {
++        p->aji_bad = true;
+         MP_ERR(vf, "pipeline drain failed: %s\n", p->api.last_error(p->aji));
+         return false;
+     }
+@@ -381,6 +585,7 @@ static void drain_backend(struct mp_filter *vf)
+ 
+     uint64_t ticket = p->api.flush(p->aji, p->stream);
+     if (ticket && p->api.wait(p->aji, ticket) != AJI_OK) {
++        p->aji_bad = true;
+         MP_WARN(vf, "backend drain failed during reset: %s\n",
+                 p->api.last_error(p->aji));
+     }
+@@ -545,6 +750,7 @@ static bool configure_aji(struct mp_filter *vf)
+     int ret = p->api.configure(p->aji, p->params.w, p->params.h, p->fps,
+                                &ow, &oh);
+     if (ret < 0) {
++        p->aji_bad = true;
+         MP_ERR(vf, "configure failed: %s\n", p->api.last_error(p->aji));
+         return false;
+     }
+@@ -910,6 +1116,7 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in)
+ 
+     uint64_t ticket = ok ? p->api.flush(p->aji, stream) : 0;
+     if (!ticket) {
++        p->aji_bad = true;
+         MP_ERR(vf, "inference failed: %s\n", p->api.last_error(p->aji));
+         // a failed call may still have queued partial device work that
+         // references `out`; let it finish before the frame is freed
+@@ -938,6 +1145,7 @@ static struct mp_image *pop_ring(struct mp_filter *vf)
+     memmove(&p->ring[0], &p->ring[1], p->ring_n * sizeof(p->ring[0]));
+ 
+     if (p->api.wait(p->aji, ticket) != AJI_OK) {
++        p->aji_bad = true;
+         MP_ERR(vf, "inference wait failed: %s\n", p->api.last_error(p->aji));
+         talloc_free(out);
+         return NULL;
+@@ -1076,6 +1284,7 @@ static struct mp_image *render_interp(struct mp_filter *vf,
+         return mp_image_new_ref(a);
+     }
+     if (ret != AJI_OK) {
++        p->aji_bad = true;
+         MP_ERR(vf, "interpolation failed: %s\n", p->api.last_error(p->aji));
+         talloc_free(out);
+         return NULL;
+@@ -1254,6 +1463,7 @@ static struct mp_image *downscale_src(struct mp_filter *vf,
+     }
+ 
+     if (ret != AJI_OK) {
++        p->aji_bad = true;
+         MP_ERR(vf, "pre-RIFE downscale failed: %s\n",
+                p->api.last_error(p->aji));
+         talloc_free(work);
+@@ -1304,6 +1514,7 @@ static struct mp_image *interp_source(struct mp_filter *vf,
+         return mp_image_new_ref(a);
+     }
+     if (ret != AJI_OK) {
++        p->aji_bad = true;
+         MP_ERR(vf, "interpolation failed: %s\n", p->api.last_error(p->aji));
+         talloc_free(out);
+         return NULL;
+@@ -1424,6 +1635,12 @@ static void vf_animejanai_process(struct mp_filter *vf)
              return;
          }
  
@@ -157,7 +330,7 @@ index 30bed265df..085e4b6a56 100644
          if (p->api.handle && !p->aji) {
              // mpv suboption values cannot contain '=', so the option takes a
              // plain lib dir and the env assignment is composed here.
-@@ -1447,8 +1549,15 @@ static void vf_animejanai_process(struct mp_filter *vf)
+@@ -1447,8 +1664,15 @@ static void vf_animejanai_process(struct mp_filter *vf)
                  .max_width = p->params.w,
                  .max_height = p->params.h,
                  .log = aji_log_bridge,
@@ -174,7 +347,7 @@ index 30bed265df..085e4b6a56 100644
              p->aji = p->api.create(&cp);
              if (!p->aji) {
                  MP_ERR(vf, "Failed to create inference context\n");
-@@ -1812,8 +1921,12 @@ static void uninit(struct mp_filter *vf)
+@@ -1812,8 +2036,12 @@ static void uninit(struct mp_filter *vf)
  
      flush_frames(vf);
      talloc_free(p->queue);
@@ -187,13 +360,37 @@ index 30bed265df..085e4b6a56 100644
      if (p->api.handle)
          aji_lib_close(p->api.handle);
      if (p->own_stream && p->cu &&
-@@ -2008,6 +2121,7 @@ static const m_option_t vf_opts_fields[] = {
+@@ -2008,6 +2236,7 @@ static const m_option_t vf_opts_fields[] = {
      {"skip-seek-pre-target", OPT_BOOL(skip_seek_pre_target)},
      {"output-444", OPT_BOOL(output_444)},
      {"queue-depth", OPT_INT(queue_depth), M_RANGE(1, MAX_DEPTH)},
 +    {"keep-engine", OPT_BOOL(keep_engine)},
      {0}
  };
+ 
+diff --git a/video/out/hwdec/hwdec_cuda.c b/video/out/hwdec/hwdec_cuda.c
+index 3995f4644d..d151c2b68d 100644
+--- a/video/out/hwdec/hwdec_cuda.c
++++ b/video/out/hwdec/hwdec_cuda.c
+@@ -145,11 +145,19 @@ static int cuda_init(struct ra_hwdec *hw)
+     return -1;
+ }
+ 
++// vf_animejanai keep-engine: a context parked on a CUDA context must go before that context does.
++void vf_animejanai_keep_drop(void *cuda_ctx, void *cuda_functions);
++
+ static void cuda_uninit(struct ra_hwdec *hw)
+ {
+     struct cuda_hw_priv *p = hw->priv;
+     CudaFunctions *cu = p->cu;
+ 
++    if (p->decode_ctx)
++        vf_animejanai_keep_drop(p->decode_ctx, cu);
++    if (p->display_ctx && p->display_ctx != p->decode_ctx)
++        vf_animejanai_keep_drop(p->display_ctx, cu);
++
+     hwdec_devices_remove(hw->devs, &p->hwctx);
+     av_buffer_unref(&p->hwctx.av_device_ref);
  
 -- 
 2.54.0.windows.1
