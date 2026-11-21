@@ -1,0 +1,46 @@
+From 4bed06643b7dc9955189f6963c1affd933ac7c8f Mon Sep 17 00:00:00 2001
+From: VideoPlayerGold snapshot <vpg@localhost>
+Date: Fri, 20 Nov 2026 21:12:22 -0500
+Subject: [PATCH] w32: VPG_START_HIDDEN - keep the window hidden the first time
+ it would be shown
+
+---
+ video/out/w32_common.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/video/out/w32_common.c b/video/out/w32_common.c
+index ba4f3825ec..723377a916 100644
+--- a/video/out/w32_common.c
++++ b/video/out/w32_common.c
+@@ -21,6 +21,7 @@
+ 
+ #define _DECL_DLLMAIN
+ #include <windows.h>
++#include <stdlib.h>
+ #include <windowsx.h>
+ #include <dwmapi.h>
+ #include <ole2.h>
+@@ -1982,7 +1983,19 @@ set_pos_done:
+ 
+     update_fullscreen_state(w32);
+ 
+-    if (!is_visible(w32->window)) {
++    // VPG (2026-11-20, D-2026-11-20-practically-instant): VPG_START_HIDDEN=1 in the environment keeps the window
++    // hidden the FIRST time it would be shown, so a player loaded ahead of the first video (VacuumTube in front, no
++    // video yet) neither appears nor takes the keyboard. Graphics still start on the hidden window. The next
++    // reconfig (the first video) shows it as usual.
++    static int vpg_start_hidden = -1;
++    if (vpg_start_hidden < 0) {
++        const char *e = getenv("VPG_START_HIDDEN");
++        vpg_start_hidden = (e && e[0] == '1') ? 1 : 0;
++    }
++    if (vpg_start_hidden == 1 && !is_visible(w32->window)) {
++        vpg_start_hidden = 0;
++        MP_VERBOSE(w32, "VPG_START_HIDDEN: window created hidden\n");
++    } else if (!is_visible(w32->window)) {
+         if (w32->opts->window_minimized) {
+             ShowWindow(w32->window, SW_SHOWMINNOACTIVE);
+         } else if (w32->opts->window_maximized && !w32->current_fs) {
+-- 
+2.54.0.windows.1
+
