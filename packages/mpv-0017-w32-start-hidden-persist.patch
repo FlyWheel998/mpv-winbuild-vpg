@@ -1,0 +1,57 @@
+From 0fdf485c799203e7dfcc4de98d348b7882ea8ff5 Mon Sep 17 00:00:00 2001
+From: FlyWheel998 <127964164+FlyWheel998@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:59:20 -0500
+Subject: [PATCH] w32: VPG_START_HIDDEN - keep hidden until shown by someone
+ else; drop it from the environment
+
+The one-shot version was undone on the couch: the hidden window is resized a
+second time when it moves to the TV (different DPI) and that pass showed it.
+Now the window stays hidden until it has been visible once (VacuumTube's
+activate helper shows it when the first video's picture is ready), and the
+variable is removed from the environment so players this one starts do not
+inherit it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012jfU48oaLYEXxpnomwYCys
+---
+ video/out/w32_common.c | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/video/out/w32_common.c b/video/out/w32_common.c
+index 723377a916..acd9941683 100644
+--- a/video/out/w32_common.c
++++ b/video/out/w32_common.c
+@@ -1984,17 +1984,25 @@ set_pos_done:
+     update_fullscreen_state(w32);
+ 
+     // VPG (2026-11-20, D-2026-11-20-practically-instant): VPG_START_HIDDEN=1 in the environment keeps the window
+-    // hidden the FIRST time it would be shown, so a player loaded ahead of the first video (VacuumTube in front, no
+-    // video yet) neither appears nor takes the keyboard. Graphics still start on the hidden window. The next
+-    // reconfig (the first video) shows it as usual.
++    // hidden until something else shows it (VacuumTube's activate helper, when the first video's picture is ready),
++    // so a player loaded ahead of the first video (VacuumTube in front, no video yet) neither appears nor takes the
++    // keyboard. Graphics still start on the hidden window. Once the window has been visible, mpv behaves as normal.
++    // 10:58 PM: was one-shot; on the couch the window is resized again when it moves to the TV (different DPI) and
++    // that second pass showed it (measured on a hidden desktop: couchscreen.lua alone reproduces it).
++    // The variable is removed from the environment once read, so players this one starts do not inherit it.
+     static int vpg_start_hidden = -1;
+     if (vpg_start_hidden < 0) {
+         const char *e = getenv("VPG_START_HIDDEN");
+         vpg_start_hidden = (e && e[0] == '1') ? 1 : 0;
++        if (e) {
++            SetEnvironmentVariableW(L"VPG_START_HIDDEN", NULL);
++            _putenv("VPG_START_HIDDEN=");
++        }
+     }
+-    if (vpg_start_hidden == 1 && !is_visible(w32->window)) {
++    if (vpg_start_hidden == 1 && is_visible(w32->window))
+         vpg_start_hidden = 0;
+-        MP_VERBOSE(w32, "VPG_START_HIDDEN: window created hidden\n");
++    if (vpg_start_hidden == 1) {
++        MP_VERBOSE(w32, "VPG_START_HIDDEN: window kept hidden\n");
+     } else if (!is_visible(w32->window)) {
+         if (w32->opts->window_minimized) {
+             ShowWindow(w32->window, SW_SHOWMINNOACTIVE);
+-- 
+2.54.0.windows.1
+
